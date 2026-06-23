@@ -1,0 +1,554 @@
+//@version=6
+// ============================================================================
+//  ICT Order Block Retest — CONFIRMATION entry (Multi-Timeframe, Path A)
+// ----------------------------------------------------------------------------
+//  Same HTF-detection / LTF-execution engine as the limit version, but the
+//  ENTRY is a two-stage confirmation instead of a passive limit:
+//
+//    Bullish OB:
+//      1) a bar pulls AT LEAST HALFWAY into the OB         (low  <= penetration level)
+//      2) the same or a later bar CLOSES ABOVE the OB top  (close > OB top)  -> ENTER
+//      3) stop  = below the OB (distal) - tick buffer
+//      4) target = R multiple of risk
+//    Bearish OB is the mirror (pull halfway up, close below the OB bottom).
+//
+//  Entry is a MARKET order on the confirmation bar's close.
+//
+//  Anti-repaint design (unchanged):
+//    - request.security() with lookahead = barmerge.lookahead_off.
+//    - OBs created only at an HTF-bar BOUNDARY (once the HTF bar has CLOSED).
+//    - Guard: context TF must be >= chart TF.
+//
+//  Recommended pairings (set the chart to the LTF, pick the HTF below):
+//      1H / 15m  (default) ,  30m / 15m ,  30m / 5m
+// ============================================================================
+
+strategy("ICT OB Retest — Confirmation", overlay = true, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0, calc_on_order_fills = false, process_orders_on_close = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpMTF = "Multi-Timeframe (Path A)"
+contextTF = input.timeframe("60", "Context (HTF) timeframe", options = ["60", "30", "240", "15"], group = grpMTF, tooltip = "Higher timeframe used to DETECT order blocks. Set your chart to the execution timeframe (e.g. 15m or 5m). Recommended pairings: 1H(60)/15m, 30m/15m, 30m/5m. Must be >= chart timeframe.")
+
+grpSwing = "Swings (Pivots)"
+pivotLeft  = input.int(5, "Pivot lookback — left",  minval = 1, group = grpSwing)
+pivotRight = input.int(5, "Pivot lookback — right", minval = 1, group = grpSwing)
+
+grpDisp = "Displacement / OB qualification"
+requireFVG = input.bool(true,  "Require FVG in displacement", group = grpDisp)
+requireBOS = input.bool(true,  "Require BOS in displacement", group = grpDisp)
+fvgWindow  = input.int(5,  "FVG lookback window (HTF bars)", minval = 1, group = grpDisp)
+obMaxBack  = input.int(10, "Max HTF bars to search back for OB candle", minval = 1, group = grpDisp)
+useATR     = input.bool(false, "Require impulse > ATR multiple", group = grpDisp)
+atrLen     = input.int(14,  "ATR length", minval = 1, group = grpDisp)
+atrMult    = input.float(1.5, "ATR multiple", minval = 0.1, step = 0.1, group = grpDisp)
+
+grpOB = "Order Blocks"
+obBodyOnly = input.bool(false, "Zone = body only (open/close)", group = grpOB)
+extendBars = input.int(5,  "Live zone forward projection (bars)", minval = 0, group = grpOB)
+maxOBs     = input.int(15, "Max OBs to keep on chart", minval = 1, group = grpOB)
+showMid    = input.bool(true, "Show 50% mean threshold line", group = grpOB)
+
+grpLife = "Lifecycle"
+expiryHtfBars   = input.int(10, "Expiry: HTF bars without retest", minval = 1, group = grpLife)
+useExpiry       = input.bool(true,  "Enable time expiry", group = grpLife)
+killOnOppBOS    = input.bool(true,  "Kill on opposing HTF BOS", group = grpLife)
+keepDeadOnChart = input.bool(true,  "Keep dead zones on chart (greyed)", group = grpLife)
+
+grpTrade = "Trade Execution (Confirmation entry)"
+penetrationPct = input.float(50.0, "Required penetration into OB (%)", minval = 1.0, maxval = 100.0, step = 5.0, group = grpTrade, tooltip = "Stage 1: a bar must pull at least this far into the order block before a confirmation close can trigger an entry. 50% = the mean threshold (halfway).")
+rMultiple  = input.float(2.0, "Reward multiple (R)", minval = 0.1, step = 0.1, group = grpTrade)
+orderQty   = input.float(1.0, "Order size (contracts/shares/lots)", minval = 0.000001, group = grpTrade)
+stopBufTicks = input.float(2.0, "Stop buffer (ticks beyond OB)", minval = 0.0, group = grpTrade)
+tradeLong  = input.bool(true, "Allow long trades", group = grpTrade)
+tradeShort = input.bool(true, "Allow short trades", group = grpTrade)
+tradeExtend = input.int(20, "Trade level line length (bars)", minval = 1, group = grpTrade)
+
+grpViz = "Visualization"
+showTradeLabels = input.bool(true, "Show entry/stop/target labels (price + R)", group = grpViz)
+showRRBoxes     = input.bool(true, "Show risk/reward shaded boxes", group = grpViz)
+showOBTooltips  = input.bool(true, "Annotate OBs with reason tooltip", group = grpViz)
+showDashboard   = input.bool(true, "Show info dashboard", group = grpViz)
+dashLocation    = input.string("Bottom Right", "Dashboard location", options = ["Top Right", "Bottom Right", "Bottom Left"], group = grpViz)
+
+grpStyle = "Style"
+colBull    = input.color(color.teal, "Bullish OB color", group = grpStyle)
+colBear    = input.color(color.red,  "Bearish OB color", group = grpStyle)
+obOpacity  = input.int(82, "Armed fill transparency", minval = 0, maxval = 100, group = grpStyle)
+colEntry   = input.color(color.blue,  "Entry color",  group = grpStyle)
+colStop    = input.color(color.red,   "Stop color",   group = grpStyle)
+colTarget  = input.color(color.green, "Target color", group = grpStyle)
+showLegend = input.bool(true, "Show color legend", group = grpStyle)
+
+// ----------------------------------------------------------------------------
+//  Helpers
+// ----------------------------------------------------------------------------
+f_px(float p) => str.tostring(p, format.mintick)
+
+// ----------------------------------------------------------------------------
+//  Pure detection functions (operate on whatever series context they run in,
+//  here the HTF series inside request.security)
+// ----------------------------------------------------------------------------
+f_findOB(bool bull, int startOff, int maxBack) =>
+    int res = -1
+    for i = startOff to startOff + maxBack
+        bool opposing = bull ? (close[i] < open[i]) : (close[i] > open[i])
+        if opposing
+            res := i
+            break
+    res
+
+f_obTop(int off, bool bodyOnly) => bodyOnly ? math.max(open[off], close[off]) : high[off]
+f_obBot(int off, bool bodyOnly) => bodyOnly ? math.min(open[off], close[off]) : low[off]
+
+// Full per-(HTF)-bar detection. Returns the OB-formation signal + levels +
+// justification for the bar it runs on, plus current HTF structure & BOS.
+// Internally stateful (var) — valid inside request.security.
+f_htfDetect() =>
+    float ph = ta.pivothigh(high, pivotLeft, pivotRight)
+    float pl = ta.pivotlow(low,  pivotLeft, pivotRight)
+
+    var float lSH = na
+    var float lSL = na
+    var bool  shB = false
+    var bool  slB = false
+    if not na(ph)
+        lSH := ph
+        shB := false
+    if not na(pl)
+        lSL := pl
+        slB := false
+
+    bool bUp = false
+    bool bDn = false
+    if not na(lSH) and not shB and close > lSH
+        bUp := true
+        shB := true
+    if not na(lSL) and not slB and close < lSL
+        bDn := true
+        slB := true
+
+    bool bFVG = low > high[2]
+    bool sFVG = high < low[2]
+    var int sinceBull = 1000000
+    var int sinceBear = 1000000
+    sinceBull := bFVG ? 0 : sinceBull + 1
+    sinceBear := sFVG ? 0 : sinceBear + 1
+
+    float a   = ta.atr(atrLen)
+    bool  aOk = not useATR or (high - low) >= atrMult * a
+    bool  recB = sinceBull <= fvgWindow
+    bool  recS = sinceBear <= fvgWindow
+
+    bool bTrig = false
+    bool sTrig = false
+    if requireBOS and requireFVG
+        bTrig := bUp and recB
+        sTrig := bDn and recS
+    else if requireBOS and not requireFVG
+        bTrig := bUp
+        sTrig := bDn
+    else if requireFVG and not requireBOS
+        bTrig := bFVG
+        sTrig := sFVG
+    else
+        bTrig := bUp or bFVG
+        sTrig := bDn or sFVG
+    bTrig := bTrig and aOk
+    sTrig := sTrig and aOk
+
+    var int lastBullBar = na
+    var int lastBearBar = na
+    bool  formed = false
+    bool  isBull = false
+    float oT = na
+    float oB = na
+    int   oTime = na   // open time of the HTF OB candle (to anchor the box)
+    bool  hF = false
+    bool  hB = false
+    bool  hA = false
+
+    if bTrig
+        int off = f_findOB(true, 1, obMaxBack)
+        if off >= 0
+            int obBar = bar_index - off
+            if na(lastBullBar) or obBar != lastBullBar
+                lastBullBar := obBar
+                formed := true
+                isBull := true
+                oT := f_obTop(off, obBodyOnly)
+                oB := f_obBot(off, obBodyOnly)
+                oTime := time[off]
+                hF := recB
+                hB := bUp
+                hA := useATR and aOk
+    if sTrig and not formed
+        int off2 = f_findOB(false, 1, obMaxBack)
+        if off2 >= 0
+            int obBar2 = bar_index - off2
+            if na(lastBearBar) or obBar2 != lastBearBar
+                lastBearBar := obBar2
+                formed := true
+                isBull := false
+                oT := f_obTop(off2, obBodyOnly)
+                oB := f_obBot(off2, obBodyOnly)
+                oTime := time[off2]
+                hF := recS
+                hB := bDn
+                hA := useATR and aOk
+
+    [formed, isBull, oT, oB, oTime, hF, hB, hA, lSH, lSL, bUp, bDn]
+
+// ----------------------------------------------------------------------------
+//  OB record type
+// ----------------------------------------------------------------------------
+type OB
+    int    id
+    int    originBar      // chart bar at creation (tap gating)
+    int    createdHtfBar  // HTF-bar count at creation (expiry)
+    bool   bull
+    float  top
+    float  bot
+    float  mid
+    float  proximal
+    float  distal
+    string state
+    bool   tapped
+    bool   traded
+    bool   hadFVG
+    bool   hadBOS
+    bool   hadATR
+    box    bx
+    line   midLn
+    label  lbl
+
+f_indexById(array<OB> store, int id) =>
+    int idx = -1
+    if array.size(store) > 0
+        for i = 0 to array.size(store) - 1
+            if array.get(store, i).id == id
+                idx := i
+                break
+    idx
+
+f_obTooltip(OB ob) =>
+    string dir = ob.bull ? "Bullish" : "Bearish"
+    string why = "Why: FVG " + (ob.hadFVG ? "✓" : "✗") + "   BOS " + (ob.hadBOS ? "✓" : "✗") + (ob.hadATR ? "   ATR ✓" : "")
+    string s = dir + " HTF Order Block  (#" + str.tostring(ob.id) + ")\n" + "Zone: " + f_px(ob.bot) + " — " + f_px(ob.top) + "\n" + "50%:  " + f_px(ob.mid) + "\n" + "Proximal: " + f_px(ob.proximal) + "   Distal: " + f_px(ob.distal) + "\n" + why
+    s
+
+// ----------------------------------------------------------------------------
+//  MTF data fetch (Path A)
+// ----------------------------------------------------------------------------
+int chartSec = timeframe.in_seconds()
+int ctxSec   = timeframe.in_seconds(contextTF)
+bool validMTF = ctxSec >= chartSec
+int barMs = chartSec * 1000   // duration of one chart bar, for time-based drawing
+
+[htfFormed, htfBull, htfTop, htfBot, htfObTime, htfHadFVG, htfHadBOS, htfHadATR, htfSH, htfSL, htfBosUp, htfBosDn] = request.security(syminfo.tickerid, contextTF, f_htfDetect(), lookahead = barmerge.lookahead_off)
+
+// HTF-bar boundary on the chart: true on the first chart bar of a new HTF bar,
+// i.e. right after the previous HTF bar closed. Under lookahead_off the HTF
+// values now reflect that just-closed bar -> safe (no repaint) to act here.
+bool newHTF = ta.change(time(contextTF)) != 0
+var int htfBarCount = 0
+if newHTF
+    htfBarCount += 1
+
+// opposing-BOS events sourced from HTF structure, evaluated at the boundary
+bool oppEventUp = newHTF and htfBosUp
+bool oppEventDn = newHTF and htfBosDn
+
+// ----------------------------------------------------------------------------
+//  OB store + creation
+// ----------------------------------------------------------------------------
+var array<OB> obs = array.new<OB>()
+
+// leftTime = open time of the HTF OB candle, so the zone is drawn over the bars
+// that actually formed it (anchored by time -> aligns on the LTF chart).
+f_addOB(array<OB> store, int id, bool bull, float t, float b, int cHtf, int leftTime, bool hadFVG, bool hadBOS, bool hadATR) =>
+    float m         = (t + b) / 2.0
+    float prox      = bull ? t : b
+    float dist      = bull ? b : t
+    color col       = bull ? colBull : colBear
+    int   anchorT   = na(leftTime) ? time : leftTime
+    int   rightT    = time + extendBars * barMs
+    box   bx        = box.new(anchorT, t, rightT, b, xloc = xloc.bar_time, border_color = col, bgcolor = color.new(col, obOpacity))
+    line  ml        = na
+    if showMid
+        ml := line.new(anchorT, m, rightT, m, xloc = xloc.bar_time, color = col, style = line.style_dotted, width = 1)
+    OB ob = OB.new(id, bar_index, cHtf, bull, t, b, m, prox, dist, "FORMED", false, false, hadFVG, hadBOS, hadATR, bx, ml, na)
+    string tip = showOBTooltips ? f_obTooltip(ob) : ""
+    label lb = label.new(anchorT, bull ? b : t, bull ? "Bull OB" : "Bear OB", xloc = xloc.bar_time, yloc = yloc.price, style = bull ? label.style_label_up : label.style_label_down, color = color.new(col, 15), textcolor = color.white, size = size.tiny, tooltip = tip)
+    ob.lbl := lb
+    array.push(store, ob)
+    if array.size(store) > maxOBs
+        OB old = array.shift(store)
+        box.delete(old.bx)
+        line.delete(old.midLn)
+        label.delete(old.lbl)
+
+var int seq = 0
+
+// create at the HTF boundary, from the just-closed HTF bar's confirmed signal.
+// (OBs are created regardless of trade direction; the long/short filter is
+//  applied later when a setup is selected.)
+if validMTF and newHTF and htfFormed
+    f_addOB(obs, seq, htfBull, htfTop, htfBot, htfBarCount, htfObTime, htfHadFVG, htfHadBOS, htfHadATR)
+    seq += 1
+
+// ----------------------------------------------------------------------------
+//  Repaint an OB box/line according to its state
+// ----------------------------------------------------------------------------
+f_paint(OB ob) =>
+    color base = ob.bull ? colBull : colBear
+    if ob.state == "DEAD"
+        box.set_bgcolor(ob.bx, color.new(color.gray, 92))
+        box.set_border_color(ob.bx, color.new(color.gray, 65))
+        box.set_border_style(ob.bx, line.style_dashed)
+        if not na(ob.midLn)
+            line.set_color(ob.midLn, color.new(color.gray, 75))
+    else if ob.state == "ACTIVE"
+        box.set_bgcolor(ob.bx, color.new(base, math.max(obOpacity - 35, 0)))
+        box.set_border_color(ob.bx, base)
+        box.set_border_width(ob.bx, 2)
+    else if ob.tapped
+        box.set_bgcolor(ob.bx, color.new(base, math.max(obOpacity - 25, 0)))
+        box.set_border_color(ob.bx, base)
+    else
+        box.set_bgcolor(ob.bx, color.new(base, obOpacity))
+        box.set_border_color(ob.bx, base)
+
+// ----------------------------------------------------------------------------
+//  Lifecycle state machine. Detection/structure come from the HTF; the retest
+//  (tap) and invalidation are evaluated on the chart for precise execution.
+// ----------------------------------------------------------------------------
+if array.size(obs) > 0
+    for i = 0 to array.size(obs) - 1
+        OB ob = array.get(obs, i)
+        if ob.state != "DEAD"
+            int rightT = time + extendBars * barMs
+            box.set_right(ob.bx, rightT)
+            if not na(ob.midLn)
+                line.set_x2(ob.midLn, rightT)
+
+            if ob.state == "FORMED" and (ob.bull ? close > ob.top : close < ob.bot)
+                ob.state := "ARMED"
+
+            bool invalid = ob.bull ? (close < ob.distal) : (close > ob.distal)
+            bool oppBOS  = ob.bull ? oppEventDn : oppEventUp
+            bool tap     = ob.bull ? (low <= ob.proximal and high >= ob.distal) : (high >= ob.proximal and low <= ob.distal)
+
+            if ob.state == "ARMED" and bar_index > ob.originBar and tap and not invalid and not ob.tapped
+                ob.tapped := true
+
+            if ob.state != "ACTIVE"
+                bool expired = useExpiry and (not ob.tapped) and (htfBarCount - ob.createdHtfBar > expiryHtfBars)
+                if invalid
+                    ob.state := "DEAD"
+                else if killOnOppBOS and oppBOS
+                    ob.state := "DEAD"
+                else if expired
+                    ob.state := "DEAD"
+
+            if ob.state == "DEAD" and not keepDeadOnChart
+                box.delete(ob.bx)
+                line.delete(ob.midLn)
+                label.delete(ob.lbl)
+            else
+                f_paint(ob)
+
+// ----------------------------------------------------------------------------
+//  Trade execution — single setup at a time (chart-based retest)
+// ----------------------------------------------------------------------------
+var bool  setupActive     = false
+var bool  setupFilled     = false
+var bool  setupReachedHalf = false   // stage 1: a bar pulled >= penetration into the OB
+var int   setupId         = -1
+var bool  setupBull       = false
+var float setupTop        = na       // OB top  (proximal for bull / distal for bear)
+var float setupBot        = na       // OB bottom (distal for bull / proximal for bear)
+var float setupEntry      = na       // set on confirmation (market fill ~ close)
+var float setupStop       = na
+var float setupTP         = na
+
+var line  glE  = na
+var line  glS  = na
+var line  glT  = na
+var label glEl = na
+var label glSl = na
+var label glTl = na
+var box   glRisk = na
+var box   glRew  = na
+
+// --- Step A: manage an existing setup -------------------------------------
+if setupActive
+    int idx = f_indexById(obs, setupId)
+    if not setupFilled
+        if strategy.position_size != 0
+            setupFilled := true
+            if idx >= 0
+                OB o = array.get(obs, idx)
+                o.state := "ACTIVE"
+        else
+            bool dead = idx < 0
+            if idx >= 0
+                dead := array.get(obs, idx).state == "DEAD"
+            if dead
+                strategy.cancel("e" + str.tostring(setupId))
+                setupActive := false
+    else
+        if strategy.position_size == 0
+            if idx >= 0
+                OB o2 = array.get(obs, idx)
+                o2.state := "DEAD"
+            setupActive  := false
+            setupFilled  := false
+
+// --- Step B: select a new setup when flat and idle ------------------------
+//   We only LATCH onto an ARMED order block here. Entry levels are not known
+//   yet — they are computed when the confirmation close fires (Step C).
+if not setupActive and strategy.position_size == 0 and array.size(obs) > 0
+    int pick = -1
+    for i = 0 to array.size(obs) - 1
+        OB o = array.get(obs, i)
+        bool dirOk = o.bull ? tradeLong : tradeShort
+        if o.state == "ARMED" and not o.traded and dirOk
+            pick := i
+    if pick >= 0
+        OB sel = array.get(obs, pick)
+        sel.traded := true
+        setupActive      := true
+        setupFilled      := false
+        setupReachedHalf := false
+        setupId          := sel.id
+        setupBull        := sel.bull
+        setupTop         := sel.top
+        setupBot         := sel.bot
+        setupEntry       := na
+        setupStop        := na
+        setupTP          := na
+
+// --- Step C: two-stage confirmation entry + manage orders -----------------
+if setupActive
+    string eid = "e" + str.tostring(setupId)
+    string xid = "x" + str.tostring(setupId)
+
+    if not setupFilled and na(setupStop)
+        float height     = setupTop - setupBot
+        // Stage 1: a bar pulls at least `penetrationPct` into the OB.
+        float penetLevel = setupBull ? setupTop - height * penetrationPct / 100.0 : setupBot + height * penetrationPct / 100.0
+        if not setupReachedHalf and (setupBull ? low <= penetLevel : high >= penetLevel)
+            setupReachedHalf := true
+
+        // Stage 2: same or later bar closes beyond the OB -> enter at market.
+        bool confirmed = setupBull ? close > setupTop : close < setupBot
+        if setupReachedHalf and confirmed
+            float buf  = stopBufTicks * syminfo.mintick
+            float E    = close
+            float SL   = setupBull ? setupBot - buf : setupTop + buf
+            float risk = math.abs(E - SL)
+            float TP   = setupBull ? E + risk * rMultiple : E - risk * rMultiple
+            setupEntry := E
+            setupStop  := SL
+            setupTP    := TP
+
+            strategy.entry(eid, setupBull ? strategy.long : strategy.short, qty = orderQty)
+
+            // draw the trade levels at the confirmation/entry point
+            int rEnd = bar_index + tradeExtend
+            if not na(glE)
+                line.delete(glE)
+                line.delete(glS)
+                line.delete(glT)
+                label.delete(glEl)
+                label.delete(glSl)
+                label.delete(glTl)
+                box.delete(glRisk)
+                box.delete(glRew)
+            glE := line.new(bar_index, E,  rEnd, E,  color = colEntry,  width = 1)
+            glS := line.new(bar_index, SL, rEnd, SL, color = colStop,   style = line.style_dashed)
+            glT := line.new(bar_index, TP, rEnd, TP, color = colTarget, style = line.style_dashed)
+            if showRRBoxes
+                glRisk := box.new(bar_index, E, rEnd, SL, border_color = color.new(colStop, 60),   bgcolor = color.new(colStop, 88))
+                glRew  := box.new(bar_index, E, rEnd, TP, border_color = color.new(colTarget, 60), bgcolor = color.new(colTarget, 88))
+            if showTradeLabels
+                glEl := label.new(rEnd, E,  "Entry " + f_px(E),  style = label.style_label_left, color = color.new(colEntry, 20),  textcolor = color.white, size = size.tiny)
+                glSl := label.new(rEnd, SL, "Stop " + f_px(SL) + "  (-1R)", style = label.style_label_left, color = color.new(colStop, 20), textcolor = color.white, size = size.tiny)
+                glTl := label.new(rEnd, TP, "Target " + f_px(TP) + "  (+" + str.tostring(rMultiple, "#.##") + "R)", style = label.style_label_left, color = color.new(colTarget, 20), textcolor = color.white, size = size.tiny)
+
+    // protective bracket (active once a confirmation entry has been placed)
+    if not na(setupStop)
+        strategy.exit(xid, from_entry = eid, stop = setupStop, limit = setupTP)
+
+// ----------------------------------------------------------------------------
+//  Color legend
+// ----------------------------------------------------------------------------
+if showLegend and barstate.islast
+    var table legend = table.new(position.top_right, 1, 8, border_width = 1)
+    table.cell(legend, 0, 0, "ICT OB Retest — Confirmation", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(legend, 0, 1, "Context: " + contextTF + "  Exec: " + timeframe.period, text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 2, "Solid fill  = ARMED (waiting)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 3, "Bold border = ACTIVE (in trade)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 4, "Grey dashed = DEAD", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 5, "Entry  (confirmation close)", text_color = colEntry,  bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 6, "Stop (beyond distal)", text_color = colStop,   bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 7, "Target (" + str.tostring(rMultiple, "#.##") + "R)", text_color = colTarget, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+//  Live info dashboard
+// ----------------------------------------------------------------------------
+f_dashPos(string loc) =>
+    loc == "Top Right" ? position.top_right : loc == "Bottom Left" ? position.bottom_left : position.bottom_right
+
+if showDashboard and barstate.islast
+    int armedCount = 0
+    if array.size(obs) > 0
+        for i = 0 to array.size(obs) - 1
+            if array.get(obs, i).state == "ARMED"
+                armedCount += 1
+
+    bool inPos  = strategy.position_size != 0
+    bool isLong = strategy.position_size > 0
+    float risk  = math.abs(setupEntry - setupStop)
+    float openR = inPos and risk > 0 ? (isLong ? (close - strategy.position_avg_price) / risk : (strategy.position_avg_price - close) / risk) : na
+    float winRate = strategy.closedtrades > 0 ? 100.0 * strategy.wintrades / strategy.closedtrades : na
+
+    var table dash = table.new(f_dashPos(dashLocation), 2, 10, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 40))
+    table.cell(dash, 0, 0, "ICT OB Retest", text_color = color.white, bgcolor = color.new(color.gray, 10), text_size = size.small)
+    table.cell(dash, 1, 0, "Confirm", text_color = color.white, bgcolor = color.new(color.gray, 10), text_size = size.small)
+
+    table.cell(dash, 0, 1, "Context / Exec", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 1, contextTF + " / " + timeframe.period, text_color = validMTF ? color.white : color.orange, text_size = size.tiny)
+
+    string posTxt = inPos ? (isLong ? "LONG" : "SHORT") : (setupActive ? "PENDING" : "FLAT")
+    color  posCol = inPos ? (isLong ? colBull : colBear) : color.new(color.gray, 0)
+    table.cell(dash, 0, 2, "Position", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 2, posTxt, text_color = posCol, text_size = size.tiny)
+
+    table.cell(dash, 0, 3, "Entry", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 3, na(setupEntry) ? "—" : f_px(setupEntry), text_color = colEntry, text_size = size.tiny)
+    table.cell(dash, 0, 4, "Stop", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 4, na(setupStop) ? "—" : f_px(setupStop), text_color = colStop, text_size = size.tiny)
+    table.cell(dash, 0, 5, "Target", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 5, na(setupTP) ? "—" : f_px(setupTP), text_color = colTarget, text_size = size.tiny)
+
+    table.cell(dash, 0, 6, "Open R", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 6, na(openR) ? "—" : str.tostring(openR, "#.##") + "R", text_color = na(openR) ? color.gray : (openR >= 0 ? colBull : colBear), text_size = size.tiny)
+
+    table.cell(dash, 0, 7, "Armed OBs", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 7, str.tostring(armedCount), text_color = color.white, text_size = size.tiny)
+
+    table.cell(dash, 0, 8, "Net P/L", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 8, str.tostring(strategy.netprofit, "#.##"), text_color = strategy.netprofit >= 0 ? colBull : colBear, text_size = size.tiny)
+
+    table.cell(dash, 0, 9, "Win% / #", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 9, (na(winRate) ? "—" : str.tostring(winRate, "#.#") + "%") + " / " + str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+//  MTF misconfiguration guard
+// ----------------------------------------------------------------------------
+var label warnLbl = na
+if barstate.islast and not validMTF and na(warnLbl)
+    warnLbl := label.new(bar_index, high, "⚠ Context TF (" + contextTF + ") must be ≥ chart TF (" + timeframe.period + ")\nNo order blocks will be created.", style = label.style_label_down, color = color.new(color.orange, 0), textcolor = color.black, size = size.normal)
