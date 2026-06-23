@@ -1,0 +1,232 @@
+//@version=6
+// ============================================================================
+//  ICT Order Block Retest — Phase 2: Order Block Identification
+// ----------------------------------------------------------------------------
+//  Builds on Phase 1 primitives (swings, FVG, BOS) to identify Order Blocks:
+//    "The last opposing candle before a qualifying displacement move."
+//
+//  Displacement is qualified by (per SPEC.md):
+//    - a Fair Value Gap in the move direction  (requireFVG, default true)
+//    - a Break of Structure in the move direction (requireBOS, default true)
+//    - optional ATR strength filter on the impulse candle (default off)
+//
+//  Each identified OB is emitted as a FORMED record carrying its key levels:
+//    top / bottom (zone), open / close (body), 50% mean threshold,
+//    proximal (edge nearest price) and distal (far edge -> future stop).
+//
+//  Still a standalone INDICATOR for visual validation. Full zone lifecycle
+//  (ARMED -> ACTIVE -> DEAD), mitigation and retest come in Phase 3/4.
+//
+//  PORT / MTF NOTE: detection stays in pure f_* functions for later
+//  request.security() wrapping (Path A). Runs on chart timeframe here.
+// ============================================================================
+
+indicator("ICT Order Block Identification — Phase 2", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpSwing = "Swings (Pivots)"
+pivotLeft  = input.int(5, "Pivot lookback — left",  minval = 1, group = grpSwing)
+pivotRight = input.int(5, "Pivot lookback — right", minval = 1, group = grpSwing)
+
+grpDisp = "Displacement / OB qualification"
+requireFVG  = input.bool(true,  "Require FVG in displacement", group = grpDisp)
+requireBOS  = input.bool(true,  "Require BOS in displacement", group = grpDisp)
+fvgWindow   = input.int(5,  "FVG lookback window (bars)", minval = 1, group = grpDisp)
+obMaxBack   = input.int(10, "Max bars to search back for OB candle", minval = 1, group = grpDisp)
+useATR      = input.bool(false, "Require impulse > ATR multiple", group = grpDisp)
+atrLen      = input.int(14,  "ATR length", minval = 1, group = grpDisp)
+atrMult     = input.float(1.5, "ATR multiple", minval = 0.1, step = 0.1, group = grpDisp)
+
+grpOB = "Order Blocks"
+obBodyOnly = input.bool(false, "Zone = body only (open/close)", group = grpOB)
+extendBars = input.int(30, "OB box extend (bars)", minval = 1, group = grpOB)
+maxOBs     = input.int(10, "Max OBs to keep on chart", minval = 1, group = grpOB)
+showMid    = input.bool(true,  "Show 50% mean threshold line", group = grpOB)
+showEdges  = input.bool(false, "Show proximal/distal edge labels", group = grpOB)
+
+grpStyle = "Style"
+colBull = input.color(color.teal, "Bullish OB color", group = grpStyle)
+colBear = input.color(color.red,  "Bearish OB color", group = grpStyle)
+obOpacity  = input.int(82, "OB fill transparency", minval = 0, maxval = 100, group = grpStyle)
+showLegend = input.bool(true, "Show legend", group = grpStyle)
+
+// ----------------------------------------------------------------------------
+//  Pure detection functions (carried over / extended from Phase 1)
+// ----------------------------------------------------------------------------
+f_pivotHigh(int l, int r) => ta.pivothigh(high, l, r)
+f_pivotLow (int l, int r) => ta.pivotlow(low,  l, r)
+
+f_bullFVG() => low > high[2]
+f_bearFVG() => high < low[2]
+
+// Locate the OB candle: scan back from `startOff` for the first OPPOSING candle
+// (a down-close for a bullish OB, an up-close for a bearish OB). Returns the bar
+// offset, or -1 if none found within `maxBack`.
+f_findOB(bool bull, int startOff, int maxBack) =>
+    int res = -1
+    for i = startOff to startOff + maxBack
+        bool opposing = bull ? (close[i] < open[i]) : (close[i] > open[i])
+        if opposing
+            res := i
+            break
+    res
+
+// Zone bounds for an OB candle at offset `off`.
+f_obTop(int off, bool bodyOnly) => bodyOnly ? math.max(open[off], close[off]) : high[off]
+f_obBot(int off, bool bodyOnly) => bodyOnly ? math.min(open[off], close[off]) : low[off]
+
+// ----------------------------------------------------------------------------
+//  OB record type — carries all key levels + drawing handles.
+//  state is reserved for Phase 3 (FORMED -> ARMED -> ACTIVE -> DEAD).
+// ----------------------------------------------------------------------------
+type OB
+    int   originBar
+    bool  bull
+    float top
+    float bot
+    float mid       // 50% mean threshold
+    float proximal  // edge nearest price on retest
+    float distal    // far edge -> stop side
+    string state
+    box   bx
+    line  midLn
+    label lbl
+
+// ----------------------------------------------------------------------------
+//  Primitive evaluation
+// ----------------------------------------------------------------------------
+ph = f_pivotHigh(pivotLeft, pivotRight)
+pl = f_pivotLow(pivotLeft, pivotRight)
+
+var float lastSH   = na
+var float lastSL   = na
+var bool  shBroken = false
+var bool  slBroken = false
+
+if not na(ph)
+    lastSH   := ph
+    shBroken := false
+if not na(pl)
+    lastSL   := pl
+    slBroken := false
+
+bool bosUp   = false
+bool bosDown = false
+if not na(lastSH) and not shBroken and close > lastSH
+    bosUp    := true
+    shBroken := true
+if not na(lastSL) and not slBroken and close < lastSL
+    bosDown  := true
+    slBroken := true
+
+bool bullFVG = f_bullFVG()
+bool bearFVG = f_bearFVG()
+
+// bars since last FVG (for the displacement window check)
+var int barsSinceBullFVG = 1000000
+var int barsSinceBearFVG = 1000000
+barsSinceBullFVG := bullFVG ? 0 : barsSinceBullFVG + 1
+barsSinceBearFVG := bearFVG ? 0 : barsSinceBearFVG + 1
+
+// optional ATR strength of the impulse (current candle range)
+float atr = ta.atr(atrLen)
+bool atrOkBull = not useATR or (high - low) >= atrMult * atr
+bool atrOkBear = atrOkBull
+
+// ----------------------------------------------------------------------------
+//  Displacement triggers
+//   Anchored on BOS when required (structure break confirms the move); the FVG
+//   condition is a recency check over the displacement window. When BOS is not
+//   required, the FVG itself is the trigger.
+// ----------------------------------------------------------------------------
+bool fvgRecentBull = barsSinceBullFVG <= fvgWindow
+bool fvgRecentBear = barsSinceBearFVG <= fvgWindow
+
+bool bullTrigger = false
+bool bearTrigger = false
+if requireBOS and requireFVG
+    bullTrigger := bosUp   and fvgRecentBull
+    bearTrigger := bosDown and fvgRecentBear
+else if requireBOS and not requireFVG
+    bullTrigger := bosUp
+    bearTrigger := bosDown
+else if requireFVG and not requireBOS
+    bullTrigger := bullFVG
+    bearTrigger := bearFVG
+else
+    bullTrigger := bosUp   or bullFVG
+    bearTrigger := bosDown or bearFVG
+
+bullTrigger := bullTrigger and atrOkBull
+bearTrigger := bearTrigger and atrOkBear
+
+// ----------------------------------------------------------------------------
+//  OB store + helper to add a new OB
+// ----------------------------------------------------------------------------
+var array<OB> obs = array.new<OB>()
+
+f_addOB(array<OB> store, bool bull, int off) =>
+    int   obBar = bar_index - off
+    float t     = f_obTop(off, obBodyOnly)
+    float b     = f_obBot(off, obBodyOnly)
+    float m     = (t + b) / 2.0
+    // proximal = edge nearest price on retest; distal = far edge (stop side)
+    float prox  = bull ? t : b
+    float dist  = bull ? b : t
+    color col   = bull ? colBull : colBear
+    int   right = bar_index + extendBars
+    box   bx    = box.new(obBar, t, right, b, border_color = col, bgcolor = color.new(col, obOpacity))
+    line  ml    = na
+    if showMid
+        ml := line.new(obBar, m, right, m, color = col, style = line.style_dotted, width = 1)
+    label lb = label.new(obBar, bull ? b : t, bull ? "Bull OB" : "Bear OB", yloc = yloc.price, style = bull ? label.style_label_up : label.style_label_down, color = color.new(col, 15), textcolor = color.white, size = size.tiny)
+    if showEdges
+        label.new(right, prox, "proximal", style = label.style_none, textcolor = col, size = size.tiny)
+        label.new(right, dist, "distal",   style = label.style_none, textcolor = col, size = size.tiny)
+    OB ob = OB.new(obBar, bull, t, b, m, prox, dist, "FORMED", bx, ml, lb)
+    array.push(store, ob)
+    // cap the number of drawn OBs (remove oldest)
+    if array.size(store) > maxOBs
+        OB old = array.shift(store)
+        box.delete(old.bx)
+        line.delete(old.midLn)
+        label.delete(old.lbl)
+
+// dedup: don't create two OBs anchored on the same candle
+var int lastBullOBbar = na
+var int lastBearOBbar = na
+
+if bullTrigger
+    int off = f_findOB(true, 1, obMaxBack)
+    if off >= 0
+        int obBar = bar_index - off
+        if na(lastBullOBbar) or obBar != lastBullOBbar
+            lastBullOBbar := obBar
+            f_addOB(obs, true, off)
+
+if bearTrigger
+    int off = f_findOB(false, 1, obMaxBack)
+    if off >= 0
+        int obBar = bar_index - off
+        if na(lastBearOBbar) or obBar != lastBearOBbar
+            lastBearOBbar := obBar
+            f_addOB(obs, false, off)
+
+// ----------------------------------------------------------------------------
+//  Legend
+// ----------------------------------------------------------------------------
+if showLegend and barstate.islast
+    var table legend = table.new(position.top_right, 1, 5, border_width = 1)
+    table.cell(legend, 0, 0, "ICT OB Identification — Phase 2", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(legend, 0, 1, "Box   = Order Block zone", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 2, "Dotted = 50% mean threshold", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 3, "Bull OB (teal)", text_color = colBull, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 4, "Bear OB (red)", text_color = colBear, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+//  Alerts
+// ----------------------------------------------------------------------------
+alertcondition(bullTrigger, title = "Bullish OB formed", message = "Bullish Order Block identified")
+alertcondition(bearTrigger, title = "Bearish OB formed", message = "Bearish Order Block identified")
