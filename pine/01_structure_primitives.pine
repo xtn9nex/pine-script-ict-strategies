@@ -1,0 +1,156 @@
+//@version=6
+// ============================================================================
+//  ICT Order Block Retest — Phase 1: Structure Primitives
+// ----------------------------------------------------------------------------
+//  Deliverables (per SPEC.md, Phase 1):
+//    1. Swing (pivot) high/low detection
+//    2. Fair Value Gap (FVG) detection
+//    3. Break of Structure (BOS) detection
+//
+//  This is a standalone INDICATOR (not the strategy) so each primitive can be
+//  visually validated in isolation before OB identification is layered on top.
+//
+//  PORT / MTF NOTE:
+//    All detection logic is kept in small, PURE functions (f_*). They operate
+//    on the chart timeframe here for transparent validation. In a later phase
+//    they will be wrapped in request.security() for the Path A multi-timeframe
+//    model (HTF context -> LTF execution) with lookahead_off + closed bars.
+//    Keeping them pure means that wrapping is a drop-in change, not a rewrite.
+// ============================================================================
+
+indicator("ICT Structure Primitives — Phase 1", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpSwing = "Swings (Pivots)"
+pivotLeft  = input.int(5, "Pivot lookback — left",  minval = 1, group = grpSwing)
+pivotRight = input.int(5, "Pivot lookback — right", minval = 1, group = grpSwing)
+showSwings = input.bool(true, "Show swing points", group = grpSwing)
+
+grpFVG = "Fair Value Gaps"
+showFVG     = input.bool(true,  "Show FVGs", group = grpFVG)
+fvgMinTicks = input.float(0.0,  "Min FVG size (ticks, 0 = off)", minval = 0.0, group = grpFVG)
+fvgExtend   = input.int(10,     "FVG box extend (bars)", minval = 1, group = grpFVG)
+
+grpBOS = "Break of Structure"
+showBOS = input.bool(true, "Show BOS / structure breaks", group = grpBOS)
+
+grpStyle = "Style"
+colBull    = input.color(color.teal, "Bullish color", group = grpStyle)
+colBear    = input.color(color.red,  "Bearish color", group = grpStyle)
+fvgBullOp  = input.int(85, "Bullish FVG transparency", minval = 0, maxval = 100, group = grpStyle)
+fvgBearOp  = input.int(85, "Bearish FVG transparency", minval = 0, maxval = 100, group = grpStyle)
+showLegend = input.bool(true, "Show legend", group = grpStyle)
+
+// ----------------------------------------------------------------------------
+//  Pure detection functions
+// ----------------------------------------------------------------------------
+
+// Swing pivots. Return the pivot price, or na when no pivot confirms on this
+// bar. A pivot is confirmed `right` bars AFTER it occurs, so the pivot bar sits
+// at (bar_index - pivotRight).
+f_pivotHigh(int l, int r) => ta.pivothigh(high, l, r)
+f_pivotLow (int l, int r) => ta.pivotlow(low,  l, r)
+
+// Fair Value Gap — 3-candle imbalance, evaluated on the 3rd (current) candle.
+//   Bullish FVG: current low is ABOVE the high of two bars ago.
+//                gap region = [ high[2] (bottom) , low (top) ]
+//   Bearish FVG: current high is BELOW the low of two bars ago.
+//                gap region = [ high (bottom) , low[2] (top) ]
+f_bullFVG()     => low > high[2]
+f_bearFVG()     => high < low[2]
+f_bullFVGSize() => low - high[2]
+f_bearFVGSize() => low[2] - high
+
+// ----------------------------------------------------------------------------
+//  1) Swing detection
+// ----------------------------------------------------------------------------
+ph = f_pivotHigh(pivotLeft, pivotRight)
+pl = f_pivotLow(pivotLeft, pivotRight)
+
+// Most recent confirmed swing levels + their origin bar (used by BOS).
+var float lastSH    = na
+var float lastSL    = na
+var int   lastSHBar = na
+var int   lastSLBar = na
+// "broken" flags ensure each swing only emits ONE structure break.
+var bool  shBroken  = false
+var bool  slBroken  = false
+
+if not na(ph)
+    lastSH    := ph
+    lastSHBar := bar_index - pivotRight
+    shBroken  := false
+if not na(pl)
+    lastSL    := pl
+    lastSLBar := bar_index - pivotRight
+    slBroken  := false
+
+// ----------------------------------------------------------------------------
+//  2) Break of Structure detection
+//     A candle CLOSES beyond the most recent (unbroken) swing level.
+//       BOS up   = close above last swing high  (bullish structure break)
+//       BOS down = close below last swing low    (bearish structure break)
+// ----------------------------------------------------------------------------
+bool bosUp   = false
+bool bosDown = false
+
+if not na(lastSH) and not shBroken and close > lastSH
+    bosUp    := true
+    shBroken := true
+if not na(lastSL) and not slBroken and close < lastSL
+    bosDown  := true
+    slBroken := true
+
+// ----------------------------------------------------------------------------
+//  3) Fair Value Gaps
+// ----------------------------------------------------------------------------
+bool bullFVG = f_bullFVG()
+bool bearFVG = f_bearFVG()
+float minGap = fvgMinTicks * syminfo.mintick
+bool bullFVGok = bullFVG and (fvgMinTicks == 0.0 or f_bullFVGSize() >= minGap)
+bool bearFVGok = bearFVG and (fvgMinTicks == 0.0 or f_bearFVGSize() >= minGap)
+
+// ----------------------------------------------------------------------------
+//  Visualization
+// ----------------------------------------------------------------------------
+
+// Swing markers — small labels at the actual pivot bar.
+if showSwings and not na(ph)
+    label.new(bar_index - pivotRight, ph, "SH", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(colBear, 20), textcolor = color.white, size = size.tiny)
+if showSwings and not na(pl)
+    label.new(bar_index - pivotRight, pl, "SL", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(colBull, 20), textcolor = color.white, size = size.tiny)
+
+// FVG boxes.
+if showFVG and bullFVGok
+    box.new(bar_index - 2, low, bar_index + fvgExtend, high[2], border_color = color.new(colBull, 40), bgcolor = color.new(colBull, fvgBullOp))
+if showFVG and bearFVGok
+    box.new(bar_index - 2, low[2], bar_index + fvgExtend, high, border_color = color.new(colBear, 40), bgcolor = color.new(colBear, fvgBearOp))
+
+// BOS — draw a line from the broken swing's origin to the break bar, + label.
+if showBOS and bosUp
+    line.new(lastSHBar, lastSH, bar_index, lastSH, color = colBull, style = line.style_dashed, width = 1)
+    label.new(bar_index, lastSH, "BOS ▲", yloc = yloc.price, style = label.style_label_down, color = color.new(colBull, 10), textcolor = color.white, size = size.tiny)
+if showBOS and bosDown
+    line.new(lastSLBar, lastSL, bar_index, lastSL, color = colBear, style = line.style_dashed, width = 1)
+    label.new(bar_index, lastSL, "BOS ▼", yloc = yloc.price, style = label.style_label_up, color = color.new(colBear, 10), textcolor = color.white, size = size.tiny)
+
+// ----------------------------------------------------------------------------
+//  Legend
+// ----------------------------------------------------------------------------
+if showLegend and barstate.islast
+    var table legend = table.new(position.top_right, 1, 5, border_width = 1)
+    table.cell(legend, 0, 0, "ICT Primitives — Phase 1", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(legend, 0, 1, "SH / SL  = swing high / low", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 2, "Boxes    = Fair Value Gaps", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 3, "BOS ▲    = bullish break", text_color = colBull, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 4, "BOS ▼    = bearish break", text_color = colBear, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+//  Alerts (handy for validation)
+// ----------------------------------------------------------------------------
+alertcondition(bosUp,    title = "BOS Up",        message = "Bullish Break of Structure")
+alertcondition(bosDown,  title = "BOS Down",      message = "Bearish Break of Structure")
+alertcondition(bullFVGok, title = "Bullish FVG",  message = "Bullish Fair Value Gap formed")
+alertcondition(bearFVGok, title = "Bearish FVG",  message = "Bearish Fair Value Gap formed")
