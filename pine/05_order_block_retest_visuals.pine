@@ -1,0 +1,490 @@
+//@version=6
+// ============================================================================
+//  ICT Order Block Retest — Phase 5: Visualization & Legend Polish
+// ----------------------------------------------------------------------------
+//  Same detection + trade logic as Phase 4 (unchanged), with a visualization
+//  layer added so the *reason* behind every trade is obvious (requirement #3):
+//
+//    - Entry / Stop / Target labels now show prices and R values.
+//    - Each Order Block carries a tooltip explaining WHY it qualified
+//      (FVG / BOS / ATR) plus its key levels (50%, proximal, distal).
+//    - Optional Risk (red) / Reward (green) shaded boxes visualize the R:R.
+//    - A live info dashboard reports position, levels, open R and backtest
+//      stats so a long backtest can be read at a glance.
+//
+//  NOTE: chart-timeframe detection for validation. Path A multi-timeframe
+//  wiring (HTF context -> LTF execution) is added in a later step.
+// ============================================================================
+
+strategy("ICT Order Block Retest — Phase 5", overlay = true, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 10, pyramiding = 0, calc_on_order_fills = false, process_orders_on_close = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpSwing = "Swings (Pivots)"
+pivotLeft  = input.int(5, "Pivot lookback — left",  minval = 1, group = grpSwing)
+pivotRight = input.int(5, "Pivot lookback — right", minval = 1, group = grpSwing)
+
+grpDisp = "Displacement / OB qualification"
+requireFVG = input.bool(true,  "Require FVG in displacement", group = grpDisp)
+requireBOS = input.bool(true,  "Require BOS in displacement", group = grpDisp)
+fvgWindow  = input.int(5,  "FVG lookback window (bars)", minval = 1, group = grpDisp)
+obMaxBack  = input.int(10, "Max bars to search back for OB candle", minval = 1, group = grpDisp)
+useATR     = input.bool(false, "Require impulse > ATR multiple", group = grpDisp)
+atrLen     = input.int(14,  "ATR length", minval = 1, group = grpDisp)
+atrMult    = input.float(1.5, "ATR multiple", minval = 0.1, step = 0.1, group = grpDisp)
+
+grpOB = "Order Blocks"
+obBodyOnly = input.bool(false, "Zone = body only (open/close)", group = grpOB)
+extendBars = input.int(5,  "Live zone forward projection (bars)", minval = 0, group = grpOB)
+maxOBs     = input.int(15, "Max OBs to keep on chart", minval = 1, group = grpOB)
+showMid    = input.bool(true, "Show 50% mean threshold line", group = grpOB)
+
+grpLife = "Lifecycle"
+expiryBars      = input.int(100, "Expiry: bars without retest", minval = 1, group = grpLife)
+useExpiry       = input.bool(true,  "Enable time expiry", group = grpLife)
+killOnOppBOS    = input.bool(true,  "Kill on opposing BOS", group = grpLife)
+keepDeadOnChart = input.bool(true,  "Keep dead zones on chart (greyed)", group = grpLife)
+
+grpTrade = "Trade Execution"
+retestMode = input.string("50% Mean Threshold", "Retest trigger level", options = ["50% Mean Threshold", "Proximal Edge", "Distal Edge"], group = grpTrade)
+entryStyle = input.string("Passive limit", "Entry style", options = ["Passive limit", "Confirmation candle"], group = grpTrade)
+targetMode = input.string("R Multiple", "Target mode", options = ["R Multiple", "Structure"], group = grpTrade)
+rMultiple  = input.float(2.0, "Reward multiple (R)", minval = 0.1, step = 0.1, group = grpTrade)
+stopBufTicks = input.float(2.0, "Stop buffer (ticks beyond distal)", minval = 0.0, group = grpTrade)
+tradeLong  = input.bool(true, "Allow long trades", group = grpTrade)
+tradeShort = input.bool(true, "Allow short trades", group = grpTrade)
+tradeExtend = input.int(20, "Trade level line length (bars)", minval = 1, group = grpTrade)
+
+grpViz = "Visualization (Phase 5)"
+showTradeLabels = input.bool(true, "Show entry/stop/target labels (price + R)", group = grpViz)
+showRRBoxes     = input.bool(true, "Show risk/reward shaded boxes", group = grpViz)
+showOBTooltips  = input.bool(true, "Annotate OBs with reason tooltip", group = grpViz)
+showDashboard   = input.bool(true, "Show info dashboard", group = grpViz)
+dashLocation    = input.string("Bottom Right", "Dashboard location", options = ["Top Right", "Bottom Right", "Bottom Left"], group = grpViz)
+
+grpStyle = "Style"
+colBull    = input.color(color.teal, "Bullish OB color", group = grpStyle)
+colBear    = input.color(color.red,  "Bearish OB color", group = grpStyle)
+obOpacity  = input.int(82, "Armed fill transparency", minval = 0, maxval = 100, group = grpStyle)
+colEntry   = input.color(color.blue,  "Entry color",  group = grpStyle)
+colStop    = input.color(color.red,   "Stop color",   group = grpStyle)
+colTarget  = input.color(color.green, "Target color", group = grpStyle)
+showLegend = input.bool(true, "Show color legend", group = grpStyle)
+
+// ----------------------------------------------------------------------------
+//  Helpers
+// ----------------------------------------------------------------------------
+f_px(float p) => str.tostring(p, format.mintick)
+
+// ----------------------------------------------------------------------------
+//  Pure detection functions
+// ----------------------------------------------------------------------------
+f_pivotHigh(int l, int r) => ta.pivothigh(high, l, r)
+f_pivotLow (int l, int r) => ta.pivotlow(low,  l, r)
+
+f_bullFVG() => low > high[2]
+f_bearFVG() => high < low[2]
+
+f_findOB(bool bull, int startOff, int maxBack) =>
+    int res = -1
+    for i = startOff to startOff + maxBack
+        bool opposing = bull ? (close[i] < open[i]) : (close[i] > open[i])
+        if opposing
+            res := i
+            break
+    res
+
+f_obTop(int off, bool bodyOnly) => bodyOnly ? math.max(open[off], close[off]) : high[off]
+f_obBot(int off, bool bodyOnly) => bodyOnly ? math.min(open[off], close[off]) : low[off]
+
+// ----------------------------------------------------------------------------
+//  OB record type (extended with trade fields + justification flags)
+// ----------------------------------------------------------------------------
+type OB
+    int    id
+    int    originBar
+    int    createdBar
+    bool   bull
+    float  top
+    float  bot
+    float  mid
+    float  proximal
+    float  distal
+    string state     // FORMED | ARMED | ACTIVE | DEAD
+    bool   tapped
+    bool   traded
+    bool   hadFVG     // justification: a FVG accompanied the displacement
+    bool   hadBOS     // justification: a BOS accompanied the displacement
+    bool   hadATR     // justification: impulse exceeded the ATR filter
+    box    bx
+    line   midLn
+    label  lbl
+
+f_entryLevel(OB ob, string mode) =>
+    mode == "Proximal Edge" ? ob.proximal : mode == "Distal Edge" ? ob.distal : ob.mid
+
+f_indexById(array<OB> store, int id) =>
+    int idx = -1
+    if array.size(store) > 0
+        for i = 0 to array.size(store) - 1
+            if array.get(store, i).id == id
+                idx := i
+                break
+    idx
+
+// Build the explanatory tooltip for an OB.
+f_obTooltip(OB ob) =>
+    string dir = ob.bull ? "Bullish" : "Bearish"
+    string why = "Why: FVG " + (ob.hadFVG ? "✓" : "✗") + "   BOS " + (ob.hadBOS ? "✓" : "✗") + (ob.hadATR ? "   ATR ✓" : "")
+    string s = dir + " Order Block  (#" + str.tostring(ob.id) + ")\n" + "Zone: " + f_px(ob.bot) + " — " + f_px(ob.top) + "\n" + "50%:  " + f_px(ob.mid) + "\n" + "Proximal: " + f_px(ob.proximal) + "   Distal: " + f_px(ob.distal) + "\n" + why
+    s
+
+// ----------------------------------------------------------------------------
+//  Primitive evaluation
+// ----------------------------------------------------------------------------
+ph = f_pivotHigh(pivotLeft, pivotRight)
+pl = f_pivotLow(pivotLeft, pivotRight)
+
+var float lastSH   = na
+var float lastSL   = na
+var bool  shBroken = false
+var bool  slBroken = false
+
+if not na(ph)
+    lastSH   := ph
+    shBroken := false
+if not na(pl)
+    lastSL   := pl
+    slBroken := false
+
+bool bosUp   = false
+bool bosDown = false
+if not na(lastSH) and not shBroken and close > lastSH
+    bosUp    := true
+    shBroken := true
+if not na(lastSL) and not slBroken and close < lastSL
+    bosDown  := true
+    slBroken := true
+
+bool bullFVG = f_bullFVG()
+bool bearFVG = f_bearFVG()
+
+var int barsSinceBullFVG = 1000000
+var int barsSinceBearFVG = 1000000
+barsSinceBullFVG := bullFVG ? 0 : barsSinceBullFVG + 1
+barsSinceBearFVG := bearFVG ? 0 : barsSinceBearFVG + 1
+
+float atr = ta.atr(atrLen)
+bool atrOk = not useATR or (high - low) >= atrMult * atr
+
+bool fvgRecentBull = barsSinceBullFVG <= fvgWindow
+bool fvgRecentBear = barsSinceBearFVG <= fvgWindow
+
+bool bullTrigger = false
+bool bearTrigger = false
+if requireBOS and requireFVG
+    bullTrigger := bosUp   and fvgRecentBull
+    bearTrigger := bosDown and fvgRecentBear
+else if requireBOS and not requireFVG
+    bullTrigger := bosUp
+    bearTrigger := bosDown
+else if requireFVG and not requireBOS
+    bullTrigger := bullFVG
+    bearTrigger := bearFVG
+else
+    bullTrigger := bosUp   or bullFVG
+    bearTrigger := bosDown or bearFVG
+
+bullTrigger := bullTrigger and atrOk
+bearTrigger := bearTrigger and atrOk
+
+// ----------------------------------------------------------------------------
+//  OB store + creation
+// ----------------------------------------------------------------------------
+var array<OB> obs = array.new<OB>()
+
+f_addOB(array<OB> store, int id, bool bull, int off, bool hadFVG, bool hadBOS, bool hadATR) =>
+    int   obBar = bar_index - off
+    float t     = f_obTop(off, obBodyOnly)
+    float b     = f_obBot(off, obBodyOnly)
+    float m     = (t + b) / 2.0
+    float prox  = bull ? t : b
+    float dist  = bull ? b : t
+    color col   = bull ? colBull : colBear
+    int   right = bar_index + extendBars
+    box   bx    = box.new(obBar, t, right, b, border_color = col, bgcolor = color.new(col, obOpacity))
+    line  ml    = na
+    if showMid
+        ml := line.new(obBar, m, right, m, color = col, style = line.style_dotted, width = 1)
+    OB ob = OB.new(id, obBar, bar_index, bull, t, b, m, prox, dist, "FORMED", false, false, hadFVG, hadBOS, hadATR, bx, ml, na)
+    string tip = showOBTooltips ? f_obTooltip(ob) : ""
+    label lb = label.new(obBar, bull ? b : t, bull ? "Bull OB" : "Bear OB", yloc = yloc.price, style = bull ? label.style_label_up : label.style_label_down, color = color.new(col, 15), textcolor = color.white, size = size.tiny, tooltip = tip)
+    ob.lbl := lb
+    array.push(store, ob)
+    if array.size(store) > maxOBs
+        OB old = array.shift(store)
+        box.delete(old.bx)
+        line.delete(old.midLn)
+        label.delete(old.lbl)
+
+var int seq           = 0
+var int lastBullOBbar = na
+var int lastBearOBbar = na
+
+if bullTrigger
+    int off = f_findOB(true, 1, obMaxBack)
+    if off >= 0
+        int obBar = bar_index - off
+        if na(lastBullOBbar) or obBar != lastBullOBbar
+            lastBullOBbar := obBar
+            f_addOB(obs, seq, true, off, fvgRecentBull, bosUp, useATR and atrOk)
+            seq += 1
+
+if bearTrigger
+    int off = f_findOB(false, 1, obMaxBack)
+    if off >= 0
+        int obBar = bar_index - off
+        if na(lastBearOBbar) or obBar != lastBearOBbar
+            lastBearOBbar := obBar
+            f_addOB(obs, seq, false, off, fvgRecentBear, bosDown, useATR and atrOk)
+            seq += 1
+
+// ----------------------------------------------------------------------------
+//  Repaint an OB box/line according to its state
+// ----------------------------------------------------------------------------
+f_paint(OB ob) =>
+    color base = ob.bull ? colBull : colBear
+    if ob.state == "DEAD"
+        box.set_bgcolor(ob.bx, color.new(color.gray, 92))
+        box.set_border_color(ob.bx, color.new(color.gray, 65))
+        box.set_border_style(ob.bx, line.style_dashed)
+        if not na(ob.midLn)
+            line.set_color(ob.midLn, color.new(color.gray, 75))
+    else if ob.state == "ACTIVE"
+        box.set_bgcolor(ob.bx, color.new(base, math.max(obOpacity - 35, 0)))
+        box.set_border_color(ob.bx, base)
+        box.set_border_width(ob.bx, 2)
+    else if ob.tapped
+        box.set_bgcolor(ob.bx, color.new(base, math.max(obOpacity - 25, 0)))
+        box.set_border_color(ob.bx, base)
+    else
+        box.set_bgcolor(ob.bx, color.new(base, obOpacity))
+        box.set_border_color(ob.bx, base)
+
+// ----------------------------------------------------------------------------
+//  Lifecycle state machine (FORMED -> ARMED, mitigation, death conditions)
+// ----------------------------------------------------------------------------
+if array.size(obs) > 0
+    for i = 0 to array.size(obs) - 1
+        OB ob = array.get(obs, i)
+        if ob.state != "DEAD"
+            box.set_right(ob.bx, bar_index + extendBars)
+            if not na(ob.midLn)
+                line.set_x2(ob.midLn, bar_index + extendBars)
+
+            if ob.state == "FORMED" and (ob.bull ? close > ob.top : close < ob.bot)
+                ob.state := "ARMED"
+
+            bool invalid = ob.bull ? (close < ob.distal) : (close > ob.distal)
+            bool oppBOS  = ob.bull ? bosDown : bosUp
+            bool tap     = ob.bull ? (low <= ob.proximal and high >= ob.distal) : (high >= ob.proximal and low <= ob.distal)
+
+            if ob.state == "ARMED" and bar_index > ob.createdBar and tap and not invalid and not ob.tapped
+                ob.tapped := true
+
+            if ob.state != "ACTIVE"
+                bool expired = useExpiry and (not ob.tapped) and (bar_index - ob.createdBar > expiryBars)
+                if invalid
+                    ob.state := "DEAD"
+                else if killOnOppBOS and oppBOS
+                    ob.state := "DEAD"
+                else if expired
+                    ob.state := "DEAD"
+
+            if ob.state == "DEAD" and not keepDeadOnChart
+                box.delete(ob.bx)
+                line.delete(ob.midLn)
+                label.delete(ob.lbl)
+            else
+                f_paint(ob)
+
+// ----------------------------------------------------------------------------
+//  Trade execution — single setup at a time (logic identical to Phase 4)
+// ----------------------------------------------------------------------------
+var bool  setupActive  = false
+var bool  setupFilled  = false
+var bool  setupReached = false
+var int   setupId      = -1
+var bool  setupBull    = false
+var float setupEntry   = na
+var float setupStop    = na
+var float setupTP      = na
+
+// drawing handles for the active trade levels + R:R boxes
+var line  glE  = na
+var line  glS  = na
+var line  glT  = na
+var label glEl = na
+var label glSl = na
+var label glTl = na
+var box   glRisk = na
+var box   glRew  = na
+
+// --- Step A: manage an existing setup -------------------------------------
+if setupActive
+    int idx = f_indexById(obs, setupId)
+    if not setupFilled
+        if strategy.position_size != 0
+            setupFilled := true
+            if idx >= 0
+                OB o = array.get(obs, idx)
+                o.state := "ACTIVE"
+        else
+            bool dead = idx < 0
+            if idx >= 0
+                dead := array.get(obs, idx).state == "DEAD"
+            if dead
+                strategy.cancel("e" + str.tostring(setupId))
+                setupActive := false
+    else
+        if strategy.position_size == 0
+            if idx >= 0
+                OB o2 = array.get(obs, idx)
+                o2.state := "DEAD"
+            setupActive  := false
+            setupFilled  := false
+
+// --- Step B: select a new setup when flat and idle ------------------------
+if not setupActive and strategy.position_size == 0 and array.size(obs) > 0
+    int pick = -1
+    for i = 0 to array.size(obs) - 1
+        OB o = array.get(obs, i)
+        bool dirOk = o.bull ? tradeLong : tradeShort
+        if o.state == "ARMED" and not o.traded and dirOk
+            pick := i   // keep latest match -> newest eligible OB
+    if pick >= 0
+        OB sel = array.get(obs, pick)
+        sel.traded := true
+        float E   = f_entryLevel(sel, retestMode)
+        float buf = stopBufTicks * syminfo.mintick
+        float SL  = sel.bull ? sel.distal - buf : sel.distal + buf
+        float risk = math.abs(E - SL)
+        float tpR  = sel.bull ? E + risk * rMultiple : E - risk * rMultiple
+        float tpStruct = sel.bull ? lastSH : lastSL
+        bool  structOk = not na(tpStruct) and (sel.bull ? tpStruct > E : tpStruct < E)
+        float TP = (targetMode == "Structure" and structOk) ? tpStruct : tpR
+
+        setupActive  := true
+        setupFilled  := false
+        setupReached := false
+        setupId      := sel.id
+        setupBull    := sel.bull
+        setupEntry   := E
+        setupStop    := SL
+        setupTP      := TP
+
+        // R of the target (for labels)
+        float tgtR = risk > 0 ? (sel.bull ? (TP - E) / risk : (E - TP) / risk) : na
+        int   rEnd = bar_index + tradeExtend
+
+        // (re)draw trade level lines
+        if not na(glE)
+            line.delete(glE)
+            line.delete(glS)
+            line.delete(glT)
+            label.delete(glEl)
+            label.delete(glSl)
+            label.delete(glTl)
+            box.delete(glRisk)
+            box.delete(glRew)
+        glE := line.new(bar_index, E,  rEnd, E,  color = colEntry,  width = 1)
+        glS := line.new(bar_index, SL, rEnd, SL, color = colStop,   style = line.style_dashed)
+        glT := line.new(bar_index, TP, rEnd, TP, color = colTarget, style = line.style_dashed)
+
+        if showRRBoxes
+            glRisk := box.new(bar_index, E, rEnd, SL, border_color = color.new(colStop, 60),   bgcolor = color.new(colStop, 88))
+            glRew  := box.new(bar_index, E, rEnd, TP, border_color = color.new(colTarget, 60), bgcolor = color.new(colTarget, 88))
+
+        if showTradeLabels
+            glEl := label.new(rEnd, E,  "Entry " + f_px(E),  style = label.style_label_left, color = color.new(colEntry, 20),  textcolor = color.white, size = size.tiny)
+            glSl := label.new(rEnd, SL, "Stop " + f_px(SL) + "  (-1R)", style = label.style_label_left, color = color.new(colStop, 20), textcolor = color.white, size = size.tiny)
+            glTl := label.new(rEnd, TP, "Target " + f_px(TP) + "  (+" + str.tostring(tgtR, "#.##") + "R)", style = label.style_label_left, color = color.new(colTarget, 20), textcolor = color.white, size = size.tiny)
+
+// --- Step C: place / maintain orders for the active setup -----------------
+if setupActive
+    string eid = "e" + str.tostring(setupId)
+    string xid = "x" + str.tostring(setupId)
+    if not setupFilled
+        if entryStyle == "Passive limit"
+            strategy.entry(eid, setupBull ? strategy.long : strategy.short, limit = setupEntry)
+        else
+            if setupBull and low <= setupEntry
+                setupReached := true
+            if (not setupBull) and high >= setupEntry
+                setupReached := true
+            bool confirm = setupBull ? (close > open) : (close < open)
+            if setupReached and confirm
+                strategy.entry(eid, setupBull ? strategy.long : strategy.short)
+    strategy.exit(xid, from_entry = eid, stop = setupStop, limit = setupTP)
+
+// ----------------------------------------------------------------------------
+//  Color legend
+// ----------------------------------------------------------------------------
+if showLegend and barstate.islast
+    var table legend = table.new(position.top_right, 1, 7, border_width = 1)
+    table.cell(legend, 0, 0, "ICT OB Retest — Phase 5", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(legend, 0, 1, "Solid fill   = ARMED (waiting)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 2, "Bold border  = ACTIVE (in trade)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 3, "Grey dashed  = DEAD", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 4, "Entry  (" + retestMode + ")", text_color = colEntry,  bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 5, "Stop (beyond distal)", text_color = colStop,   bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 6, "Target (" + targetMode + ")", text_color = colTarget, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+
+// ----------------------------------------------------------------------------
+//  Live info dashboard
+// ----------------------------------------------------------------------------
+f_dashPos(string loc) =>
+    loc == "Top Right" ? position.top_right : loc == "Bottom Left" ? position.bottom_left : position.bottom_right
+
+if showDashboard and barstate.islast
+    // count armed zones
+    int armedCount = 0
+    if array.size(obs) > 0
+        for i = 0 to array.size(obs) - 1
+            if array.get(obs, i).state == "ARMED"
+                armedCount += 1
+
+    bool inPos = strategy.position_size != 0
+    bool isLong = strategy.position_size > 0
+    float risk = math.abs(setupEntry - setupStop)
+    float openR = inPos and risk > 0 ? (isLong ? (close - strategy.position_avg_price) / risk : (strategy.position_avg_price - close) / risk) : na
+    float winRate = strategy.closedtrades > 0 ? 100.0 * strategy.wintrades / strategy.closedtrades : na
+
+    var table dash = table.new(f_dashPos(dashLocation), 2, 9, border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 40))
+    table.cell(dash, 0, 0, "ICT OB Retest", text_color = color.white, bgcolor = color.new(color.gray, 10), text_size = size.small)
+    table.cell(dash, 1, 0, "Phase 5", text_color = color.white, bgcolor = color.new(color.gray, 10), text_size = size.small)
+
+    string posTxt = inPos ? (isLong ? "LONG" : "SHORT") : (setupActive ? "PENDING" : "FLAT")
+    color  posCol = inPos ? (isLong ? colBull : colBear) : color.new(color.gray, 0)
+    table.cell(dash, 0, 1, "Position", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 1, posTxt, text_color = posCol, text_size = size.tiny)
+
+    table.cell(dash, 0, 2, "Entry", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 2, setupActive ? f_px(setupEntry) : "—", text_color = colEntry, text_size = size.tiny)
+    table.cell(dash, 0, 3, "Stop", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 3, setupActive ? f_px(setupStop) : "—", text_color = colStop, text_size = size.tiny)
+    table.cell(dash, 0, 4, "Target", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 4, setupActive ? f_px(setupTP) : "—", text_color = colTarget, text_size = size.tiny)
+
+    table.cell(dash, 0, 5, "Open R", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 5, na(openR) ? "—" : str.tostring(openR, "#.##") + "R", text_color = na(openR) ? color.gray : (openR >= 0 ? colBull : colBear), text_size = size.tiny)
+
+    table.cell(dash, 0, 6, "Armed OBs", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 6, str.tostring(armedCount), text_color = color.white, text_size = size.tiny)
+
+    table.cell(dash, 0, 7, "Net P/L", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 7, str.tostring(strategy.netprofit, "#.##"), text_color = strategy.netprofit >= 0 ? colBull : colBear, text_size = size.tiny)
+
+    table.cell(dash, 0, 8, "Win% / #", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 8, (na(winRate) ? "—" : str.tostring(winRate, "#.#") + "%") + " / " + str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.tiny)
