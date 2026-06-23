@@ -59,7 +59,8 @@ rMultiple  = input.float(2.0, "Reward multiple (R)", minval = 0.1, step = 0.1, g
 stopBufTicks = input.float(2.0, "Stop buffer (ticks beyond distal)", minval = 0.0, group = grpTrade)
 tradeLong  = input.bool(true, "Allow long trades", group = grpTrade)
 tradeShort = input.bool(true, "Allow short trades", group = grpTrade)
-tradeExtend = input.int(20, "Trade level line length (bars)", minval = 1, group = grpTrade)
+tradeExtend = input.int(20, "Pending plan line length (bars)", minval = 1, group = grpTrade)
+showTradeMarks = input.bool(true, "Mark executed trades across history", group = grpTrade)
 
 grpStyle = "Style"
 colBull    = input.color(color.teal, "Bullish OB color", group = grpStyle)
@@ -303,13 +304,22 @@ var float setupEntry   = na
 var float setupStop    = na
 var float setupTP      = na
 
-// drawing handles for the active trade levels
+// drawing handles for the current pending plan (transient — shows the setup
+// we are currently waiting on; replaced when a new setup is selected)
 var line  glE  = na
 var line  glS  = na
 var line  glT  = na
 var label glEl = na
 var label glSl = na
 var label glTl = na
+
+// drawing handles for the in-progress executed trade. These are created on
+// fill, extended for the duration of the trade, then RELEASED (never deleted)
+// so every historical trade stays marked across the whole backtest.
+var line  trE = na
+var line  trS = na
+var line  trT = na
+var label trL = na
 
 // --- Step A: manage an existing setup -------------------------------------
 if setupActive
@@ -320,6 +330,22 @@ if setupActive
             if idx >= 0
                 OB o = array.get(obs, idx)
                 o.state := "ACTIVE"
+            // hand off: clear the transient pending preview...
+            if not na(glE)
+                line.delete(glE)
+                line.delete(glS)
+                line.delete(glT)
+                label.delete(glEl)
+                label.delete(glSl)
+                label.delete(glTl)
+                glE := na
+            // ...and start a persistent marker at the actual fill price.
+            if showTradeMarks
+                float ey = strategy.position_avg_price
+                trE := line.new(bar_index, ey,        bar_index, ey,        color = color.new(color.blue, 0),  width = 2)
+                trS := line.new(bar_index, setupStop,  bar_index, setupStop, color = color.new(color.red, 0),   width = 1, style = line.style_dotted)
+                trT := line.new(bar_index, setupTP,    bar_index, setupTP,   color = color.new(color.green, 0), width = 1, style = line.style_dotted)
+                trL := label.new(bar_index, ey, setupBull ? "▲ entry" : "▼ entry", yloc = yloc.price, style = setupBull ? label.style_label_up : label.style_label_down, color = color.new(setupBull ? colBull : colBear, 0), textcolor = color.white, size = size.tiny)
         else
             bool dead = idx < 0
             if idx >= 0
@@ -332,17 +358,32 @@ if setupActive
             if idx >= 0
                 OB o2 = array.get(obs, idx)
                 o2.state := "DEAD"
+            // finalize + RELEASE the trade marker (leave it drawn on the chart)
+            if not na(trE)
+                line.set_x2(trE, bar_index)
+                line.set_x2(trS, bar_index)
+                line.set_x2(trT, bar_index)
+                trE := na
+                trS := na
+                trT := na
+                trL := na
             setupActive  := false
             setupFilled  := false
 
 // --- Step B: select a new setup when flat and idle ------------------------
 if not setupActive and strategy.position_size == 0 and array.size(obs) > 0
-    int pick = -1
+    int   pick     = -1
+    float bestDist = 1.0e18
     for i = 0 to array.size(obs) - 1
         OB o = array.get(obs, i)
         bool dirOk = o.bull ? tradeLong : tradeShort
         if o.state == "ARMED" and not o.traded and dirOk
-            pick := i   // keep latest match -> newest eligible OB
+            // pick the eligible zone whose entry is nearest to current price
+            // (most likely to be retested next) -> better backtest coverage
+            float d = math.abs(close - f_entryLevel(o, retestMode))
+            if d < bestDist
+                bestDist := d
+                pick := i
     if pick >= 0
         OB sel = array.get(obs, pick)
         sel.traded := true
@@ -397,11 +438,17 @@ if setupActive
     // keep the protective bracket attached (active once the entry fills)
     strategy.exit(xid, from_entry = eid, stop = setupStop, limit = setupTP)
 
+// --- extend the persistent trade marker while the trade is open -----------
+if setupFilled and showTradeMarks and not na(trE)
+    line.set_x2(trE, bar_index)
+    line.set_x2(trS, bar_index)
+    line.set_x2(trT, bar_index)
+
 // ----------------------------------------------------------------------------
 //  Legend
 // ----------------------------------------------------------------------------
 if showLegend and barstate.islast
-    var table legend = table.new(position.top_right, 1, 7, border_width = 1)
+    var table legend = table.new(position.top_right, 1, 8, border_width = 1)
     table.cell(legend, 0, 0, "ICT OB Retest — Phase 4", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
     table.cell(legend, 0, 1, "Solid fill   = ARMED (waiting)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
     table.cell(legend, 0, 2, "Bold border  = ACTIVE (in trade)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
@@ -409,3 +456,4 @@ if showLegend and barstate.islast
     table.cell(legend, 0, 4, "Blue  = Entry  (" + retestMode + ")", text_color = color.blue,  bgcolor = color.new(color.black, 30), text_size = size.tiny)
     table.cell(legend, 0, 5, "Red   = Stop (beyond distal)", text_color = color.red,   bgcolor = color.new(color.black, 30), text_size = size.tiny)
     table.cell(legend, 0, 6, "Green = Target (" + targetMode + ")", text_color = color.green, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 7, "Dotted spans = executed trades", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
