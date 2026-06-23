@@ -1,0 +1,279 @@
+//@version=6
+// ============================================================================
+//  ICT Order Block Retest — Phase 3: Zone Lifecycle / State Machine
+// ----------------------------------------------------------------------------
+//  Builds on Phase 2 (OB identification). Drives each OB through its lifecycle:
+//
+//      FORMED ──> ARMED ──> (ACTIVE in Phase 4) ──> DEAD
+//
+//  Implemented here:
+//    - FORMED  : OB just identified (drawn, no trade).
+//    - ARMED   : price displaced away; zone is fresh/unmitigated (retest-ready).
+//    - tap      : price re-enters the zone (proximal touch). Marks the start of
+//                 mitigation. Previews the Phase 4 entry location; does NOT kill
+//                 the zone by itself.
+//    - DEAD    : retired via (a) invalidation = body close through the distal
+//                 edge, (b) opposing Break of Structure, or (c) expiry after
+//                 N bars without a retest.
+//
+//  Drawing is dynamic: live zones extend with price, dead zones freeze + grey.
+//
+//  NOTE: still a standalone INDICATOR on the chart timeframe for validation.
+//  Expiry is counted in chart bars here; it maps to "N context-TF candles" once
+//  the Path A multi-timeframe wiring is added. Detection stays in pure f_*.
+// ============================================================================
+
+indicator("ICT OB Zone Lifecycle — Phase 3", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpSwing = "Swings (Pivots)"
+pivotLeft  = input.int(5, "Pivot lookback — left",  minval = 1, group = grpSwing)
+pivotRight = input.int(5, "Pivot lookback — right", minval = 1, group = grpSwing)
+
+grpDisp = "Displacement / OB qualification"
+requireFVG = input.bool(true,  "Require FVG in displacement", group = grpDisp)
+requireBOS = input.bool(true,  "Require BOS in displacement", group = grpDisp)
+fvgWindow  = input.int(5,  "FVG lookback window (bars)", minval = 1, group = grpDisp)
+obMaxBack  = input.int(10, "Max bars to search back for OB candle", minval = 1, group = grpDisp)
+useATR     = input.bool(false, "Require impulse > ATR multiple", group = grpDisp)
+atrLen     = input.int(14,  "ATR length", minval = 1, group = grpDisp)
+atrMult    = input.float(1.5, "ATR multiple", minval = 0.1, step = 0.1, group = grpDisp)
+
+grpOB = "Order Blocks"
+obBodyOnly = input.bool(false, "Zone = body only (open/close)", group = grpOB)
+extendBars = input.int(5,  "Live zone forward projection (bars)", minval = 0, group = grpOB)
+maxOBs     = input.int(15, "Max OBs to keep on chart", minval = 1, group = grpOB)
+showMid    = input.bool(true, "Show 50% mean threshold line", group = grpOB)
+
+grpLife = "Lifecycle"
+expiryBars      = input.int(100, "Expiry: bars without retest", minval = 1, group = grpLife)
+useExpiry       = input.bool(true,  "Enable time expiry", group = grpLife)
+killOnOppBOS    = input.bool(true,  "Kill on opposing BOS", group = grpLife)
+keepDeadOnChart = input.bool(true,  "Keep dead zones on chart (greyed)", group = grpLife)
+
+grpStyle = "Style"
+colBull    = input.color(color.teal, "Bullish OB color", group = grpStyle)
+colBear    = input.color(color.red,  "Bearish OB color", group = grpStyle)
+obOpacity  = input.int(82, "Armed fill transparency", minval = 0, maxval = 100, group = grpStyle)
+showLegend = input.bool(true, "Show legend", group = grpStyle)
+
+// ----------------------------------------------------------------------------
+//  Pure detection functions
+// ----------------------------------------------------------------------------
+f_pivotHigh(int l, int r) => ta.pivothigh(high, l, r)
+f_pivotLow (int l, int r) => ta.pivotlow(low,  l, r)
+
+f_bullFVG() => low > high[2]
+f_bearFVG() => high < low[2]
+
+f_findOB(bool bull, int startOff, int maxBack) =>
+    int res = -1
+    for i = startOff to startOff + maxBack
+        bool opposing = bull ? (close[i] < open[i]) : (close[i] > open[i])
+        if opposing
+            res := i
+            break
+    res
+
+f_obTop(int off, bool bodyOnly) => bodyOnly ? math.max(open[off], close[off]) : high[off]
+f_obBot(int off, bool bodyOnly) => bodyOnly ? math.min(open[off], close[off]) : low[off]
+
+// ----------------------------------------------------------------------------
+//  OB record type (extended for lifecycle)
+// ----------------------------------------------------------------------------
+type OB
+    int    originBar
+    int    createdBar
+    bool   bull
+    float  top
+    float  bot
+    float  mid       // 50% mean threshold
+    float  proximal  // edge nearest price on retest
+    float  distal    // far edge -> stop side
+    string state     // FORMED | ARMED | DEAD  (ACTIVE added in Phase 4)
+    bool   tapped     // has price re-entered the zone (mitigation started)
+    box    bx
+    line   midLn
+    label  lbl
+
+// ----------------------------------------------------------------------------
+//  Primitive evaluation
+// ----------------------------------------------------------------------------
+ph = f_pivotHigh(pivotLeft, pivotRight)
+pl = f_pivotLow(pivotLeft, pivotRight)
+
+var float lastSH   = na
+var float lastSL   = na
+var bool  shBroken = false
+var bool  slBroken = false
+
+if not na(ph)
+    lastSH   := ph
+    shBroken := false
+if not na(pl)
+    lastSL   := pl
+    slBroken := false
+
+bool bosUp   = false
+bool bosDown = false
+if not na(lastSH) and not shBroken and close > lastSH
+    bosUp    := true
+    shBroken := true
+if not na(lastSL) and not slBroken and close < lastSL
+    bosDown  := true
+    slBroken := true
+
+bool bullFVG = f_bullFVG()
+bool bearFVG = f_bearFVG()
+
+var int barsSinceBullFVG = 1000000
+var int barsSinceBearFVG = 1000000
+barsSinceBullFVG := bullFVG ? 0 : barsSinceBullFVG + 1
+barsSinceBearFVG := bearFVG ? 0 : barsSinceBearFVG + 1
+
+float atr = ta.atr(atrLen)
+bool atrOk = not useATR or (high - low) >= atrMult * atr
+
+bool fvgRecentBull = barsSinceBullFVG <= fvgWindow
+bool fvgRecentBear = barsSinceBearFVG <= fvgWindow
+
+bool bullTrigger = false
+bool bearTrigger = false
+if requireBOS and requireFVG
+    bullTrigger := bosUp   and fvgRecentBull
+    bearTrigger := bosDown and fvgRecentBear
+else if requireBOS and not requireFVG
+    bullTrigger := bosUp
+    bearTrigger := bosDown
+else if requireFVG and not requireBOS
+    bullTrigger := bullFVG
+    bearTrigger := bearFVG
+else
+    bullTrigger := bosUp   or bullFVG
+    bearTrigger := bosDown or bearFVG
+
+bullTrigger := bullTrigger and atrOk
+bearTrigger := bearTrigger and atrOk
+
+// ----------------------------------------------------------------------------
+//  OB store + creation
+// ----------------------------------------------------------------------------
+var array<OB> obs = array.new<OB>()
+
+f_addOB(array<OB> store, bool bull, int off) =>
+    int   obBar = bar_index - off
+    float t     = f_obTop(off, obBodyOnly)
+    float b     = f_obBot(off, obBodyOnly)
+    float m     = (t + b) / 2.0
+    float prox  = bull ? t : b
+    float dist  = bull ? b : t
+    color col   = bull ? colBull : colBear
+    int   right = bar_index + extendBars
+    box   bx    = box.new(obBar, t, right, b, border_color = col, bgcolor = color.new(col, obOpacity))
+    line  ml    = na
+    if showMid
+        ml := line.new(obBar, m, right, m, color = col, style = line.style_dotted, width = 1)
+    label lb = label.new(obBar, bull ? b : t, bull ? "Bull OB" : "Bear OB", yloc = yloc.price, style = bull ? label.style_label_up : label.style_label_down, color = color.new(col, 15), textcolor = color.white, size = size.tiny)
+    OB ob = OB.new(obBar, bar_index, bull, t, b, m, prox, dist, "FORMED", false, bx, ml, lb)
+    array.push(store, ob)
+    if array.size(store) > maxOBs
+        OB old = array.shift(store)
+        box.delete(old.bx)
+        line.delete(old.midLn)
+        label.delete(old.lbl)
+
+var int lastBullOBbar = na
+var int lastBearOBbar = na
+
+if bullTrigger
+    int off = f_findOB(true, 1, obMaxBack)
+    if off >= 0
+        int obBar = bar_index - off
+        if na(lastBullOBbar) or obBar != lastBullOBbar
+            lastBullOBbar := obBar
+            f_addOB(obs, true, off)
+
+if bearTrigger
+    int off = f_findOB(false, 1, obMaxBack)
+    if off >= 0
+        int obBar = bar_index - off
+        if na(lastBearOBbar) or obBar != lastBearOBbar
+            lastBearOBbar := obBar
+            f_addOB(obs, false, off)
+
+// ----------------------------------------------------------------------------
+//  Repaint an OB box/line according to its state
+// ----------------------------------------------------------------------------
+f_paint(OB ob) =>
+    color base = ob.bull ? colBull : colBear
+    if ob.state == "DEAD"
+        box.set_bgcolor(ob.bx, color.new(color.gray, 92))
+        box.set_border_color(ob.bx, color.new(color.gray, 65))
+        box.set_border_style(ob.bx, line.style_dashed)
+        if not na(ob.midLn)
+            line.set_color(ob.midLn, color.new(color.gray, 75))
+    else if ob.tapped
+        box.set_bgcolor(ob.bx, color.new(base, math.max(obOpacity - 25, 0)))
+        box.set_border_color(ob.bx, base)
+    else
+        box.set_bgcolor(ob.bx, color.new(base, obOpacity))
+        box.set_border_color(ob.bx, base)
+
+// ----------------------------------------------------------------------------
+//  Lifecycle state machine — evaluated every bar for all live OBs
+// ----------------------------------------------------------------------------
+if array.size(obs) > 0
+    for i = 0 to array.size(obs) - 1
+        OB ob = array.get(obs, i)
+        if ob.state != "DEAD"
+            // extend live zones to track price
+            box.set_right(ob.bx, bar_index + extendBars)
+            if not na(ob.midLn)
+                line.set_x2(ob.midLn, bar_index + extendBars)
+
+            // FORMED -> ARMED once price has displaced away from the zone
+            if ob.state == "FORMED" and (ob.bull ? close > ob.top : close < ob.bot)
+                ob.state := "ARMED"
+
+            // signals for this bar
+            bool invalid = ob.bull ? (close < ob.distal) : (close > ob.distal)
+            bool oppBOS  = ob.bull ? bosDown : bosUp
+            bool tap     = ob.bull ? (low <= ob.proximal and high >= ob.distal) : (high >= ob.proximal and low <= ob.distal)
+
+            // mitigation tap (retest started) — marks zone, does not kill it.
+            // Only valid once ARMED and on a bar AFTER formation, so the
+            // displacement candle itself can't count as its own retest.
+            if ob.state == "ARMED" and bar_index > ob.createdBar and tap and not invalid and not ob.tapped
+                ob.tapped := true
+                label.new(bar_index, ob.proximal, "retest", yloc = yloc.price, style = ob.bull ? label.style_label_up : label.style_label_down, color = color.new(ob.bull ? colBull : colBear, 0), textcolor = color.white, size = size.tiny)
+
+            // death conditions (priority: invalidation > opposing BOS > expiry)
+            bool expired = useExpiry and (not ob.tapped) and (bar_index - ob.createdBar > expiryBars)
+            if invalid
+                ob.state := "DEAD"
+            else if killOnOppBOS and oppBOS
+                ob.state := "DEAD"
+            else if expired
+                ob.state := "DEAD"
+
+            // clean up if dead zones should not be kept
+            if ob.state == "DEAD" and not keepDeadOnChart
+                box.delete(ob.bx)
+                line.delete(ob.midLn)
+                label.delete(ob.lbl)
+            else
+                f_paint(ob)
+
+// ----------------------------------------------------------------------------
+//  Legend
+// ----------------------------------------------------------------------------
+if showLegend and barstate.islast
+    var table legend = table.new(position.top_right, 1, 6, border_width = 1)
+    table.cell(legend, 0, 0, "ICT OB Lifecycle — Phase 3", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(legend, 0, 1, "Solid fill  = ARMED (fresh)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 2, "Brighter    = tapped (mitigating)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 3, "Grey dashed = DEAD", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 4, "Bull OB (teal)", text_color = colBull, bgcolor = color.new(color.black, 30), text_size = size.tiny)
+    table.cell(legend, 0, 5, "Bear OB (red)", text_color = colBear, bgcolor = color.new(color.black, 30), text_size = size.tiny)
