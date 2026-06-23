@@ -2,8 +2,10 @@
 // ============================================================================
 //  ICT Order Block Retest — Phase 5: Visualization & Legend Polish
 // ----------------------------------------------------------------------------
-//  Same detection + trade logic as Phase 4 (unchanged), with a visualization
-//  layer added so the *reason* behind every trade is obvious (requirement #3):
+//  Same detection as Phase 4, plus an execution fix (pending setups are
+//  protected from lifecycle death + freed by a timeout, so retests actually
+//  fill — see the trade-execution section), and a visualization layer so the
+//  *reason* behind every trade is obvious (requirement #3):
 //
 //    - Entry / Stop / Target labels now show prices and R values.
 //    - Each Order Block carries a tooltip explaining WHY it qualified
@@ -54,6 +56,7 @@ rMultiple  = input.float(2.0, "Reward multiple (R)", minval = 0.1, step = 0.1, g
 stopBufTicks = input.float(2.0, "Stop buffer (ticks beyond distal)", minval = 0.0, group = grpTrade)
 tradeLong  = input.bool(true, "Allow long trades", group = grpTrade)
 tradeShort = input.bool(true, "Allow short trades", group = grpTrade)
+pendingTimeout = input.int(30, "Pending setup timeout (bars)", minval = 1, group = grpTrade, tooltip = "If a selected setup is not filled within this many bars, cancel it and look for the next one. While pending, the setup's zone is protected from being killed by an opposing BOS or expiry so the retest can complete.")
 tradeExtend = input.int(20, "Trade level line length (bars)", minval = 1, group = grpTrade)
 
 grpViz = "Visualization (Phase 5)"
@@ -114,6 +117,7 @@ type OB
     string state     // FORMED | ARMED | ACTIVE | DEAD
     bool   tapped
     bool   traded
+    bool   pending    // currently selected as the active (unfilled) setup
     bool   hadFVG     // justification: a FVG accompanied the displacement
     bool   hadBOS     // justification: a BOS accompanied the displacement
     bool   hadATR     // justification: impulse exceeded the ATR filter
@@ -217,7 +221,7 @@ f_addOB(array<OB> store, int id, bool bull, int off, bool hadFVG, bool hadBOS, b
     line  ml    = na
     if showMid
         ml := line.new(obBar, m, right, m, color = col, style = line.style_dotted, width = 1)
-    OB ob = OB.new(id, obBar, bar_index, bull, t, b, m, prox, dist, "FORMED", false, false, hadFVG, hadBOS, hadATR, bx, ml, na)
+    OB ob = OB.new(id, obBar, bar_index, bull, t, b, m, prox, dist, "FORMED", false, false, false, hadFVG, hadBOS, hadATR, bx, ml, na)
     string tip = showOBTooltips ? f_obTooltip(ob) : ""
     label lb = label.new(obBar, bull ? b : t, bull ? "Bull OB" : "Bear OB", yloc = yloc.price, style = bull ? label.style_label_up : label.style_label_down, color = color.new(col, 15), textcolor = color.white, size = size.tiny, tooltip = tip)
     ob.lbl := lb
@@ -293,7 +297,11 @@ if array.size(obs) > 0
             if ob.state == "ARMED" and bar_index > ob.createdBar and tap and not invalid and not ob.tapped
                 ob.tapped := true
 
-            if ob.state != "ACTIVE"
+            // ACTIVE (in trade) and PENDING (selected, awaiting fill) zones are
+            // protected — otherwise the retest pullback's own opposing BOS would
+            // kill the zone before the entry can fill. The trade manager handles
+            // these via stop/target (ACTIVE) or the pending timeout (PENDING).
+            if ob.state != "ACTIVE" and not ob.pending
                 bool expired = useExpiry and (not ob.tapped) and (bar_index - ob.createdBar > expiryBars)
                 if invalid
                     ob.state := "DEAD"
@@ -310,16 +318,22 @@ if array.size(obs) > 0
                 f_paint(ob)
 
 // ----------------------------------------------------------------------------
-//  Trade execution — single setup at a time (logic identical to Phase 4)
+//  Trade execution — single setup at a time.
+//  Same retest/entry/stop/target rules as Phase 4, plus a fix so trades
+//  actually fill: while a setup is PENDING its zone is protected from lifecycle
+//  death (so the retest pullback's own opposing BOS can't cancel it), and an
+//  unfilled setup is freed by a bar timeout instead of relying on the zone
+//  dying. Detection and entry styles are unchanged.
 // ----------------------------------------------------------------------------
-var bool  setupActive  = false
-var bool  setupFilled  = false
-var bool  setupReached = false
-var int   setupId      = -1
-var bool  setupBull    = false
-var float setupEntry   = na
-var float setupStop    = na
-var float setupTP      = na
+var bool  setupActive   = false
+var bool  setupFilled   = false
+var bool  setupReached  = false
+var int   setupId       = -1
+var int   setupStartBar = na
+var bool  setupBull     = false
+var float setupEntry    = na
+var float setupStop     = na
+var float setupTP       = na
 
 // drawing handles for the active trade levels + R:R boxes
 var line  glE  = na
@@ -336,19 +350,27 @@ if setupActive
     int idx = f_indexById(obs, setupId)
     if not setupFilled
         if strategy.position_size != 0
+            // entry filled -> becomes an ACTIVE trade
             setupFilled := true
             if idx >= 0
                 OB o = array.get(obs, idx)
-                o.state := "ACTIVE"
+                o.state   := "ACTIVE"
+                o.pending := false
         else
-            bool dead = idx < 0
-            if idx >= 0
-                dead := array.get(obs, idx).state == "DEAD"
-            if dead
+            // free the setup if it never fills within the timeout window, or if
+            // the zone got shifted off the chart (idx < 0)
+            bool gone     = idx < 0
+            bool timedOut = bar_index - setupStartBar > pendingTimeout
+            if gone or timedOut
                 strategy.cancel("e" + str.tostring(setupId))
+                if idx >= 0
+                    OB ox = array.get(obs, idx)
+                    ox.pending := false
+                    ox.state   := "DEAD"
                 setupActive := false
     else
         if strategy.position_size == 0
+            // trade closed (stop/target hit)
             if idx >= 0
                 OB o2 = array.get(obs, idx)
                 o2.state := "DEAD"
@@ -365,7 +387,8 @@ if not setupActive and strategy.position_size == 0 and array.size(obs) > 0
             pick := i   // keep latest match -> newest eligible OB
     if pick >= 0
         OB sel = array.get(obs, pick)
-        sel.traded := true
+        sel.traded  := true
+        sel.pending := true
         float E   = f_entryLevel(sel, retestMode)
         float buf = stopBufTicks * syminfo.mintick
         float SL  = sel.bull ? sel.distal - buf : sel.distal + buf
@@ -375,14 +398,15 @@ if not setupActive and strategy.position_size == 0 and array.size(obs) > 0
         bool  structOk = not na(tpStruct) and (sel.bull ? tpStruct > E : tpStruct < E)
         float TP = (targetMode == "Structure" and structOk) ? tpStruct : tpR
 
-        setupActive  := true
-        setupFilled  := false
-        setupReached := false
-        setupId      := sel.id
-        setupBull    := sel.bull
-        setupEntry   := E
-        setupStop    := SL
-        setupTP      := TP
+        setupActive   := true
+        setupFilled   := false
+        setupReached  := false
+        setupId       := sel.id
+        setupStartBar := bar_index
+        setupBull     := sel.bull
+        setupEntry    := E
+        setupStop     := SL
+        setupTP       := TP
 
         // R of the target (for labels)
         float tgtR = risk > 0 ? (sel.bull ? (TP - E) / risk : (E - TP) / risk) : na
