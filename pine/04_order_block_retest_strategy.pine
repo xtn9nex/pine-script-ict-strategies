@@ -59,7 +59,7 @@ rMultiple  = input.float(2.0, "Reward multiple (R)", minval = 0.1, step = 0.1, g
 stopBufTicks = input.float(2.0, "Stop buffer (ticks beyond distal)", minval = 0.0, group = grpTrade)
 tradeLong  = input.bool(true, "Allow long trades", group = grpTrade)
 tradeShort = input.bool(true, "Allow short trades", group = grpTrade)
-showTradeMarks = input.bool(true, "Mark executed trades across history", group = grpTrade)
+tradeExtend = input.int(20, "Trade level line length (bars)", minval = 1, group = grpTrade)
 
 grpStyle = "Style"
 colBull    = input.color(color.teal, "Bullish OB color", group = grpStyle)
@@ -292,78 +292,60 @@ if array.size(obs) > 0
                 f_paint(ob)
 
 // ----------------------------------------------------------------------------
-//  Trade execution — one position at a time, MARKET entry on a confirmed
-//  retest. We detect the bar on which price actually reaches the trigger level
-//  inside an ARMED zone, then fire a market order (guaranteed fill) with a
-//  protective stop/target bracket. This avoids the resting-limit "never fills /
-//  setup gets stuck" failure mode.
+//  Trade execution — single setup at a time
 // ----------------------------------------------------------------------------
-var int   curObId = -1
-var bool  curBull = false
-var float curSL   = na
-var float curTP   = na
-var bool  inTrade = false
+var bool  setupActive  = false
+var bool  setupFilled  = false
+var bool  setupReached = false
+var int   setupId      = -1
+var bool  setupBull    = false
+var float setupEntry   = na
+var float setupStop    = na
+var float setupTP      = na
 
-// persistent executed-trade markers (created on fill, extended while the trade
-// is open, then RELEASED — never deleted — so every historical trade stays
-// marked across the whole backtest).
-var line  trE = na
-var line  trS = na
-var line  trT = na
-var label trL = na
+// drawing handles for the active trade levels
+var line  glE  = na
+var line  glS  = na
+var line  glT  = na
+var label glEl = na
+var label glSl = na
+var label glTl = na
 
-// --- exit detection: the trade just closed (stop/target hit) --------------
-if inTrade and strategy.position_size == 0
-    int idx = f_indexById(obs, curObId)
-    if idx >= 0
-        OB oc = array.get(obs, idx)
-        oc.state := "DEAD"
-    if not na(trE)
-        line.set_x2(trE, bar_index)
-        line.set_x2(trS, bar_index)
-        line.set_x2(trT, bar_index)
-        trE := na
-        trS := na
-        trT := na
-        trL := na
-    inTrade := false
-    curObId := -1
+// --- Step A: manage an existing setup -------------------------------------
+if setupActive
+    int idx = f_indexById(obs, setupId)
+    if not setupFilled
+        if strategy.position_size != 0
+            setupFilled := true
+            if idx >= 0
+                OB o = array.get(obs, idx)
+                o.state := "ACTIVE"
+        else
+            bool dead = idx < 0
+            if idx >= 0
+                dead := array.get(obs, idx).state == "DEAD"
+            if dead
+                strategy.cancel("e" + str.tostring(setupId))
+                setupActive := false
+    else
+        if strategy.position_size == 0
+            if idx >= 0
+                OB o2 = array.get(obs, idx)
+                o2.state := "DEAD"
+            setupActive  := false
+            setupFilled  := false
 
-// --- fill detection: the trade just opened --------------------------------
-if (not inTrade) and strategy.position_size != 0
-    inTrade := true
-    int idx = f_indexById(obs, curObId)
-    if idx >= 0
-        OB oa = array.get(obs, idx)
-        oa.state := "ACTIVE"
-    if showTradeMarks
-        float ey = strategy.position_avg_price
-        trE := line.new(bar_index, ey,    bar_index, ey,    color = color.new(color.blue, 0),  width = 2)
-        trS := line.new(bar_index, curSL, bar_index, curSL, color = color.new(color.red, 0),   width = 1, style = line.style_dotted)
-        trT := line.new(bar_index, curTP, bar_index, curTP, color = color.new(color.green, 0), width = 1, style = line.style_dotted)
-        trL := label.new(bar_index, ey, curBull ? "▲ entry" : "▼ entry", yloc = yloc.price, style = curBull ? label.style_label_up : label.style_label_down, color = color.new(curBull ? colBull : colBear, 0), textcolor = color.white, size = size.tiny)
-
-// --- entry: scan ARMED zones for a confirmed retest this bar --------------
-if strategy.position_size == 0 and not inTrade and array.size(obs) > 0
-    int   pick     = -1
-    float bestDist = 1.0e18
+// --- Step B: select a new setup when flat and idle ------------------------
+if not setupActive and strategy.position_size == 0 and array.size(obs) > 0
+    int pick = -1
     for i = 0 to array.size(obs) - 1
         OB o = array.get(obs, i)
         bool dirOk = o.bull ? tradeLong : tradeShort
         if o.state == "ARMED" and not o.traded and dirOk
-            float E       = f_entryLevel(o, retestMode)
-            bool  reached = o.bull ? (low <= E) : (high >= E)
-            bool  valid   = o.bull ? (close >= o.distal) : (close <= o.distal)
-            bool  confirm = entryStyle == "Confirmation candle" ? (o.bull ? close > open : close < open) : true
-            if reached and valid and confirm
-                float d = math.abs(close - E)   // nearest eligible zone first
-                if d < bestDist
-                    bestDist := d
-                    pick := i
+            pick := i   // keep latest match -> newest eligible OB
     if pick >= 0
         OB sel = array.get(obs, pick)
         sel.traded := true
-        sel.state  := "ACTIVE"   // protect from lifecycle death while trading
         float E   = f_entryLevel(sel, retestMode)
         float buf = stopBufTicks * syminfo.mintick
         float SL  = sel.bull ? sel.distal - buf : sel.distal + buf
@@ -372,29 +354,54 @@ if strategy.position_size == 0 and not inTrade and array.size(obs) > 0
         float tpStruct = sel.bull ? lastSH : lastSL
         bool  structOk = not na(tpStruct) and (sel.bull ? tpStruct > E : tpStruct < E)
         float TP = (targetMode == "Structure" and structOk) ? tpStruct : tpR
-        curObId := sel.id
-        curBull := sel.bull
-        curSL   := SL
-        curTP   := TP
-        string eid = "OB" + str.tostring(sel.id)
-        strategy.entry(eid, sel.bull ? strategy.long : strategy.short)
-        strategy.exit("X" + str.tostring(sel.id), from_entry = eid, stop = SL, limit = TP)
 
-// --- keep the protective bracket attached for the whole trade -------------
-if strategy.position_size != 0 and curObId >= 0
-    strategy.exit("X" + str.tostring(curObId), from_entry = "OB" + str.tostring(curObId), stop = curSL, limit = curTP)
+        setupActive  := true
+        setupFilled  := false
+        setupReached := false
+        setupId      := sel.id
+        setupBull    := sel.bull
+        setupEntry   := E
+        setupStop    := SL
+        setupTP      := TP
 
-// --- extend the persistent trade marker while the trade is open -----------
-if inTrade and showTradeMarks and not na(trE)
-    line.set_x2(trE, bar_index)
-    line.set_x2(trS, bar_index)
-    line.set_x2(trT, bar_index)
+        // (re)draw trade level lines/labels
+        if not na(glE)
+            line.delete(glE)
+            line.delete(glS)
+            line.delete(glT)
+            label.delete(glEl)
+            label.delete(glSl)
+            label.delete(glTl)
+        glE  := line.new(bar_index, E,  bar_index + tradeExtend, E,  color = color.new(color.blue, 0), width = 1)
+        glS  := line.new(bar_index, SL, bar_index + tradeExtend, SL, color = color.new(color.red, 0),  style = line.style_dashed)
+        glT  := line.new(bar_index, TP, bar_index + tradeExtend, TP, color = color.new(color.green, 0), style = line.style_dashed)
+        glEl := label.new(bar_index + tradeExtend, E,  "Entry", style = label.style_none, textcolor = color.blue,  size = size.tiny)
+        glSl := label.new(bar_index + tradeExtend, SL, "SL",    style = label.style_none, textcolor = color.red,   size = size.tiny)
+        glTl := label.new(bar_index + tradeExtend, TP, "TP",    style = label.style_none, textcolor = color.green, size = size.tiny)
+
+// --- Step C: place / maintain orders for the active setup -----------------
+if setupActive
+    string eid = "e" + str.tostring(setupId)
+    string xid = "x" + str.tostring(setupId)
+    if not setupFilled
+        if entryStyle == "Passive limit"
+            strategy.entry(eid, setupBull ? strategy.long : strategy.short, limit = setupEntry)
+        else
+            if setupBull and low <= setupEntry
+                setupReached := true
+            if (not setupBull) and high >= setupEntry
+                setupReached := true
+            bool confirm = setupBull ? (close > open) : (close < open)
+            if setupReached and confirm
+                strategy.entry(eid, setupBull ? strategy.long : strategy.short)
+    // keep the protective bracket attached (active once the entry fills)
+    strategy.exit(xid, from_entry = eid, stop = setupStop, limit = setupTP)
 
 // ----------------------------------------------------------------------------
 //  Legend
 // ----------------------------------------------------------------------------
 if showLegend and barstate.islast
-    var table legend = table.new(position.top_right, 1, 8, border_width = 1)
+    var table legend = table.new(position.top_right, 1, 7, border_width = 1)
     table.cell(legend, 0, 0, "ICT OB Retest — Phase 4", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
     table.cell(legend, 0, 1, "Solid fill   = ARMED (waiting)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
     table.cell(legend, 0, 2, "Bold border  = ACTIVE (in trade)", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
@@ -402,4 +409,3 @@ if showLegend and barstate.islast
     table.cell(legend, 0, 4, "Blue  = Entry  (" + retestMode + ")", text_color = color.blue,  bgcolor = color.new(color.black, 30), text_size = size.tiny)
     table.cell(legend, 0, 5, "Red   = Stop (beyond distal)", text_color = color.red,   bgcolor = color.new(color.black, 30), text_size = size.tiny)
     table.cell(legend, 0, 6, "Green = Target (" + targetMode + ")", text_color = color.green, bgcolor = color.new(color.black, 30), text_size = size.tiny)
-    table.cell(legend, 0, 7, "Dotted spans = executed trades", text_color = color.white, bgcolor = color.new(color.black, 30), text_size = size.tiny)
