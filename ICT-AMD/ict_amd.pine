@@ -67,6 +67,7 @@ var bool  rejected  = false
 var box   distBox   = na
 var float distExt   = na
 var int   distStart = na
+var int   lastEndBar = na   // bar where the previous setup's distribution ended
 
 bool amdSignal = false   // true on the bar the FVG completes the sequence
 
@@ -78,7 +79,10 @@ if phase == 0
     float aB  = ta.lowest(low,  accumLen)[1]
     float buf = sweepBufTicks * syminfo.mintick
     bool  tight = (aT - aB) > 0 and (aT - aB) <= accumMaxAtr * atr
-    if tight and allowBear and high > aT + buf
+    // do not start a new setup until its accumulation window is fully past the
+    // previous setup's distribution (prevents overlapping drawings)
+    bool  canStart = na(lastEndBar) or (bar_index - accumLen) > lastEndBar
+    if canStart and tight and allowBear and high > aT + buf
         accTop     := aT
         accBot     := aB
         accEnd     := bar_index - 1
@@ -88,7 +92,7 @@ if phase == 0
         manipStart := bar_index
         rejected   := false
         phase      := 2
-    else if tight and allowBull and low < aB - buf
+    else if canStart and tight and allowBull and low < aB - buf
         accTop     := aT
         accBot     := aB
         accEnd     := bar_index - 1
@@ -132,12 +136,13 @@ if phase == 2
         float fvgTop = biasBear ? low[2] : low
         float fvgBot = biasBear ? high   : high[2]
         box.new(bar_index - 2, fvgTop, bar_index + fvgExtend, fvgBot, border_color = color.new(color.orange, 0), bgcolor = colFvg)
-        // 4) Distribution — zone that will extend with price during phase 3.
-        //    The moving edge tracks the extreme; the fixed edge is the range.
+        // 4) Distribution — zone that begins right at the FVG and extends with
+        //    price during phase 3. The fixed edge is anchored to the FVG so the
+        //    zone is connected to it; the moving edge tracks the extreme.
         distExt   := biasBear ? low : high
         distStart := bar_index
-        float dBoxTop = biasBear ? accBot : distExt
-        float dBoxBot = biasBear ? distExt : accTop
+        float dBoxTop = biasBear ? fvgBot : distExt   // bearish: top = FVG lower edge
+        float dBoxBot = biasBear ? distExt : fvgTop   // bullish: bottom = FVG upper edge
         distBox   := box.new(bar_index, dBoxTop, bar_index + 1, dBoxBot, border_color = color.new(color.blue, 40), bgcolor = colDist)
 
         if showLabels
@@ -162,6 +167,7 @@ if phase == 3
     if bar_index - distStart > distExtend
         phase := 0
         rejected := false
+        lastEndBar := bar_index
 
 // ----------------------------------------------------------------------------
 //  Signal marker + alert
