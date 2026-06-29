@@ -13,8 +13,11 @@
 //                         break BELOW  -> bullish bias (distribute up)
 //    3) FVG (SIGNAL)  — the first Fair Value Gap in the distribution
 //                       direction after the rejection. Triggers everything.
-//    4) DISTRIBUTION  — the move after the FVG, drawn as a zone that extends
-//                       with price.
+//    4) TARGET/STOP   — instead of a distribution box, the trade's risk/reward
+//                       is drawn: a RED stop block (entry -> beyond the
+//                       manipulation extreme) and a GREEN target block
+//                       (entry -> R multiple). They extend until price hits
+//                       the stop or the target.
 //
 //  Nothing is drawn until the FVG completes the sequence. Each completed
 //  sequence leaves its boxes on the chart as a historical signal.
@@ -37,9 +40,11 @@ grpDir = "Direction"
 allowBear = input.bool(true, "Detect bearish AMD (sweep up → down)", group = grpDir)
 allowBull = input.bool(true, "Detect bullish AMD (sweep down → up)", group = grpDir)
 
-grpDist = "Distribution"
-distExtend = input.int(40, "Distribution zone length (bars)", minval = 1, group = grpDist)
-fvgExtend  = input.int(8, "FVG box length (bars)", minval = 1, group = grpDist)
+grpTrade = "Targets / Stops"
+rMultiple    = input.float(2.0, "Reward multiple (R)", minval = 0.1, step = 0.1, group = grpTrade)
+stopBufTicks = input.float(2.0, "Stop buffer beyond manipulation (ticks)", minval = 0.0, group = grpTrade)
+plLen        = input.int(40, "Target/Stop zone length (bars)", minval = 1, group = grpTrade, tooltip = "Max bars the target/stop blocks extend; they also stop extending once price hits the stop or the target.")
+fvgExtend    = input.int(8, "FVG box length (bars)", minval = 1, group = grpTrade)
 
 grpStyle = "Style"
 // Base colors — balanced mid-luminance tones that read well on both light and
@@ -47,7 +52,8 @@ grpStyle = "Style"
 accumColor = input.color(#2e9e6a, "Accumulation (green)", group = grpStyle)
 manipColor = input.color(#e23b3b, "Manipulation (red)",   group = grpStyle)
 fvgColor   = input.color(#f5a623, "FVG / signal (orange)", group = grpStyle)
-distColor  = input.color(#3a7bd5, "Distribution (blue)",  group = grpStyle)
+tpColor    = input.color(#26a69a, "Target / profit (green)", group = grpStyle)
+slColor    = input.color(#ef5350, "Stop loss (red)",         group = grpStyle)
 fillTransp = input.int(82, "Zone fill transparency", minval = 0, maxval = 100, group = grpStyle)
 showLabels = input.bool(true, "Show phase labels", group = grpStyle)
 
@@ -55,7 +61,8 @@ showLabels = input.bool(true, "Show phase labels", group = grpStyle)
 color colAccum = color.new(accumColor, fillTransp)
 color colManip = color.new(manipColor, fillTransp)
 color colFvg   = color.new(fvgColor, 30)
-color colDist  = color.new(distColor, fillTransp)
+color colTp    = color.new(tpColor, fillTransp)
+color colSl    = color.new(slColor, fillTransp)
 
 // ----------------------------------------------------------------------------
 //  State
@@ -63,7 +70,7 @@ color colDist  = color.new(distColor, fillTransp)
 float atr = ta.atr(atrLen)
 
 // phase: 0 = seeking accumulation+sweep, 2 = manipulation underway (await FVG),
-//        3 = distribution underway
+//        3 = trade live (target/stop blocks extending until resolved)
 var int   phase     = 0
 var float accTop    = na
 var float accBot    = na
@@ -73,10 +80,12 @@ var bool  biasBear  = true
 var float manipExt  = na
 var int   manipStart = na
 var bool  rejected  = false
-var box   distBox   = na
-var float distExt   = na
-var int   distStart = na
-var int   lastEndBar = na   // bar where the previous setup's distribution ended
+var box   tpBox    = na     // green reward (entry -> target) block
+var box   slBox    = na     // red risk (entry -> stop) block
+var float plStop   = na
+var float plTarget = na
+var int   distStart = na    // bar the target/stop blocks started
+var int   lastEndBar = na   // bar where the previous setup resolved
 
 bool amdSignal = false   // true on the bar the FVG completes the sequence
 
@@ -145,35 +154,46 @@ if phase == 2
         float fvgTop = biasBear ? low[2] : low
         float fvgBot = biasBear ? high   : high[2]
         box.new(bar_index - 2, fvgTop, bar_index + fvgExtend, fvgBot, border_color = color.new(fvgColor, 0), bgcolor = colFvg)
-        // 4) Distribution — zone that begins right at the FVG and extends with
-        //    price during phase 3. The fixed edge is anchored to the FVG so the
-        //    zone is connected to it; the moving edge tracks the extreme.
-        distExt   := biasBear ? low : high
+        // 4) Target & Stop blocks (replace the old distribution box).
+        //    Entry  = FVG midpoint.
+        //    Stop   = just beyond the manipulation extreme (swept liquidity).
+        //    Target = R multiple of the risk.
+        float entry  = (fvgTop + fvgBot) / 2.0
+        float buf    = stopBufTicks * syminfo.mintick
+        float stop   = biasBear ? manipExt + buf : manipExt - buf
+        float risk   = math.abs(entry - stop)
+        float target = biasBear ? entry - rMultiple * risk : entry + rMultiple * risk
+        plStop    := stop
+        plTarget  := target
         distStart := bar_index
-        float dBoxTop = biasBear ? fvgBot : distExt   // bearish: top = FVG lower edge
-        float dBoxBot = biasBear ? distExt : fvgTop   // bullish: bottom = FVG upper edge
-        distBox   := box.new(bar_index, dBoxTop, bar_index + 1, dBoxBot, border_color = color.new(distColor, 30), bgcolor = colDist)
+        // red risk block (entry <-> stop) and green reward block (entry <-> target)
+        float slTop = biasBear ? stop  : entry
+        float slBot = biasBear ? entry : stop
+        float tpTop = biasBear ? entry : target
+        float tpBot = biasBear ? target : entry
+        slBox := box.new(bar_index, slTop, bar_index + 1, slBot, border_color = color.new(slColor, 20), bgcolor = colSl)
+        tpBox := box.new(bar_index, tpTop, bar_index + 1, tpBot, border_color = color.new(tpColor, 20), bgcolor = colTp)
 
         if showLabels
             label.new(int((accStart + accEnd) / 2), accTop, "Accumulation", yloc = yloc.price, style = label.style_label_down, color = color.new(accumColor, 0), textcolor = color.white, size = size.small)
             label.new(manipStart, mTop, "Manipulation", yloc = yloc.price, style = label.style_label_down, color = color.new(manipColor, 0), textcolor = color.white, size = size.small)
             label.new(bar_index, biasBear ? fvgBot : fvgTop, "FVG", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(fvgColor, 0), textcolor = color.black, size = size.small)
-            label.new(bar_index + 1, distExt, "Distribution", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(distColor, 0), textcolor = color.white, size = size.small)
+            label.new(bar_index + 1, target, "Target", yloc = yloc.price, style = label.style_label_left, color = color.new(tpColor, 0), textcolor = color.white, size = size.small)
+            label.new(bar_index + 1, stop,   "Stop",   yloc = yloc.price, style = label.style_label_left, color = color.new(slColor, 0), textcolor = color.white, size = size.small)
 
         phase := 3
 
 // ----------------------------------------------------------------------------
-//  Phase 3 — distribution: extend the distribution zone with price
+//  Phase 3 — extend the target/stop blocks until price resolves them
 // ----------------------------------------------------------------------------
 if phase == 3
-    distExt := biasBear ? math.min(distExt, low) : math.max(distExt, high)
-    if not na(distBox)
-        box.set_right(distBox, bar_index)
-        if biasBear
-            box.set_bottom(distBox, distExt)
-        else
-            box.set_top(distBox, distExt)
-    if bar_index - distStart > distExtend
+    if not na(tpBox)
+        box.set_right(tpBox, bar_index)
+    if not na(slBox)
+        box.set_right(slBox, bar_index)
+    bool tHit = biasBear ? low <= plTarget : high >= plTarget
+    bool sHit = biasBear ? high >= plStop  : low <= plStop
+    if tHit or sHit or (bar_index - distStart > plLen)
         phase := 0
         rejected := false
         lastEndBar := bar_index
@@ -189,9 +209,10 @@ alertcondition(amdSignal, title = "AMD FVG signal", message = "ICT AMD sequence 
 //  Legend
 // ----------------------------------------------------------------------------
 if showLabels and barstate.islast
-    var table lg = table.new(position.top_right, 1, 5, border_width = 1)
+    var table lg = table.new(position.top_right, 1, 6, border_width = 1)
     table.cell(lg, 0, 0, "ICT AMD", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
     table.cell(lg, 0, 1, "1 Accumulation (range)", text_color = color.white, bgcolor = accumColor, text_size = size.tiny)
     table.cell(lg, 0, 2, "2 Manipulation (sweep)", text_color = color.white, bgcolor = manipColor, text_size = size.tiny)
     table.cell(lg, 0, 3, "3 FVG (signal)", text_color = color.black, bgcolor = fvgColor, text_size = size.tiny)
-    table.cell(lg, 0, 4, "4 Distribution (move)", text_color = color.white, bgcolor = distColor, text_size = size.tiny)
+    table.cell(lg, 0, 4, "Target (" + str.tostring(rMultiple, "#.##") + "R)", text_color = color.white, bgcolor = tpColor, text_size = size.tiny)
+    table.cell(lg, 0, 5, "Stop (beyond manip)", text_color = color.white, bgcolor = slColor, text_size = size.tiny)
