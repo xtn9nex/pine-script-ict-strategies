@@ -5,8 +5,9 @@
 //  Detects the AMD sequence and only draws it once the phases form IN ORDER.
 //  The MAIN SIGNAL is the formation of the first FVG (step 3).
 //
-//    1) ACCUMULATION  — a tight consolidation over `accumLen` bars
-//                       (range <= accumMaxAtr x ATR).
+//    1) ACCUMULATION  — a tight consolidation, detected adaptively: the base is
+//                       grown backward from the breakout while its high-low
+//                       range stays within accumMaxAtr x ATR (>= minAccumBars).
 //    2) MANIPULATION  — a sweep/breakout beyond that range that is then
 //                       REJECTED (price closes back inside the range):
 //                         break ABOVE  -> bearish bias (distribute down)
@@ -29,9 +30,10 @@ indicator("ICT AMD — Accumulation/Manipulation/Distribution", overlay = true, 
 //  Inputs
 // ----------------------------------------------------------------------------
 grpDetect = "Detection"
-accumLen     = input.int(20, "Accumulation window (bars)", minval = 3, group = grpDetect)
 atrLen       = input.int(14, "ATR length", minval = 1, group = grpDetect)
-accumMaxAtr  = input.float(4.0, "Max accumulation range (× ATR)", minval = 0.1, step = 0.1, group = grpDetect, tooltip = "The consolidation only counts as accumulation if its high-low range is within this many ATRs (i.e. it is genuinely tight).")
+accumMaxAtr  = input.float(2.0, "Max accumulation range (× ATR)", minval = 0.1, step = 0.1, group = grpDetect, tooltip = "The base is grown backward from the breakout only while its high-low range stays within this many ATRs, so the box hugs a genuinely tight consolidation.")
+minAccumBars = input.int(8, "Min accumulation length (bars)", minval = 2, group = grpDetect, tooltip = "A tight base must be at least this many bars to qualify as accumulation (filters out brief pauses).")
+maxAccumBars = input.int(60, "Max accumulation lookback (bars)", minval = 5, group = grpDetect, tooltip = "How far back to grow the consolidation while it stays tight.")
 sweepBufTicks = input.float(0.0, "Sweep buffer (ticks)", minval = 0.0, group = grpDetect, tooltip = "Price must exceed the range edge by this many ticks to count as a manipulation sweep.")
 manipMaxBars = input.int(15, "Max bars from sweep to FVG", minval = 1, group = grpDetect, tooltip = "If the rejection + FVG do not occur within this many bars of the sweep, the setup is abandoned.")
 requireReject = input.bool(true, "Require manipulation to be rejected", group = grpDetect, tooltip = "Require price to close back inside the accumulation range (sweep rejected) before accepting the FVG signal.")
@@ -93,28 +95,46 @@ bool amdSignal = false   // true on the bar the FVG completes the sequence
 //  Phase 0 — find a tight range, then a sweep beyond it (manipulation start)
 // ----------------------------------------------------------------------------
 if phase == 0
-    float aT  = ta.highest(high, accumLen)[1]
-    float aB  = ta.lowest(low,  accumLen)[1]
-    float buf = sweepBufTicks * syminfo.mintick
-    bool  tight = (aT - aB) > 0 and (aT - aB) <= accumMaxAtr * atr
-    // do not start a new setup until its accumulation window is fully past the
-    // previous setup's distribution (prevents overlapping drawings)
-    bool  canStart = na(lastEndBar) or (bar_index - accumLen) > lastEndBar
-    if canStart and tight and allowBear and high > aT + buf
-        accTop     := aT
-        accBot     := aB
+    float buf      = sweepBufTicks * syminfo.mintick
+    float maxRange = accumMaxAtr * atr
+
+    // Grow the consolidation backward from the bar before the current one,
+    // adding bars only while the running high-low range stays tight. This makes
+    // the box hug the actual base instead of a fixed-size window.
+    float rngHigh = high[1]
+    float rngLow  = low[1]
+    int   baseLen = 1
+    for i = 2 to maxAccumBars
+        if na(high[i]) or na(low[i])
+            break
+        float nh = math.max(rngHigh, high[i])
+        float nl = math.min(rngLow,  low[i])
+        if (nh - nl) > maxRange
+            break
+        rngHigh := nh
+        rngLow  := nl
+        baseLen := i
+
+    bool baseOk = baseLen >= minAccumBars and (rngHigh - rngLow) > 0
+    int  accStartCand = bar_index - baseLen
+    // do not start a new setup until its base is fully past the previous setup
+    bool canStart = na(lastEndBar) or accStartCand > lastEndBar
+
+    if baseOk and canStart and allowBear and high > rngHigh + buf
+        accTop     := rngHigh
+        accBot     := rngLow
         accEnd     := bar_index - 1
-        accStart   := bar_index - accumLen
+        accStart   := accStartCand
         biasBear   := true
         manipExt   := high
         manipStart := bar_index
         rejected   := false
         phase      := 2
-    else if canStart and tight and allowBull and low < aB - buf
-        accTop     := aT
-        accBot     := aB
+    else if baseOk and canStart and allowBull and low < rngLow - buf
+        accTop     := rngHigh
+        accBot     := rngLow
         accEnd     := bar_index - 1
-        accStart   := bar_index - accumLen
+        accStart   := accStartCand
         biasBear   := false
         manipExt   := low
         manipStart := bar_index
