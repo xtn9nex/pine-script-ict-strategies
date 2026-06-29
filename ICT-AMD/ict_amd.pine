@@ -1,0 +1,182 @@
+//@version=6
+// ============================================================================
+//  ICT AMD — Accumulation / Manipulation / Distribution  (Power of 3)
+// ----------------------------------------------------------------------------
+//  Detects the AMD sequence and only draws it once the phases form IN ORDER.
+//  The MAIN SIGNAL is the formation of the first FVG (step 3).
+//
+//    1) ACCUMULATION  — a tight consolidation over `accumLen` bars
+//                       (range <= accumMaxAtr x ATR).
+//    2) MANIPULATION  — a sweep/breakout beyond that range that is then
+//                       REJECTED (price closes back inside the range):
+//                         break ABOVE  -> bearish bias (distribute down)
+//                         break BELOW  -> bullish bias (distribute up)
+//    3) FVG (SIGNAL)  — the first Fair Value Gap in the distribution
+//                       direction after the rejection. Triggers everything.
+//    4) DISTRIBUTION  — the move after the FVG, drawn as a zone that extends
+//                       with price.
+//
+//  Nothing is drawn until the FVG completes the sequence. Each completed
+//  sequence leaves its boxes on the chart as a historical signal.
+// ============================================================================
+
+indicator("ICT AMD — Accumulation/Manipulation/Distribution", overlay = true, max_boxes_count = 500, max_lines_count = 200, max_labels_count = 200)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpDetect = "Detection"
+accumLen     = input.int(20, "Accumulation window (bars)", minval = 3, group = grpDetect)
+atrLen       = input.int(14, "ATR length", minval = 1, group = grpDetect)
+accumMaxAtr  = input.float(4.0, "Max accumulation range (× ATR)", minval = 0.1, step = 0.1, group = grpDetect, tooltip = "The consolidation only counts as accumulation if its high-low range is within this many ATRs (i.e. it is genuinely tight).")
+sweepBufTicks = input.float(0.0, "Sweep buffer (ticks)", minval = 0.0, group = grpDetect, tooltip = "Price must exceed the range edge by this many ticks to count as a manipulation sweep.")
+manipMaxBars = input.int(15, "Max bars from sweep to FVG", minval = 1, group = grpDetect, tooltip = "If the rejection + FVG do not occur within this many bars of the sweep, the setup is abandoned.")
+requireReject = input.bool(true, "Require manipulation to be rejected", group = grpDetect, tooltip = "Require price to close back inside the accumulation range (sweep rejected) before accepting the FVG signal.")
+
+grpDir = "Direction"
+allowBear = input.bool(true, "Detect bearish AMD (sweep up → down)", group = grpDir)
+allowBull = input.bool(true, "Detect bullish AMD (sweep down → up)", group = grpDir)
+
+grpDist = "Distribution"
+distExtend = input.int(40, "Distribution zone length (bars)", minval = 1, group = grpDist)
+fvgExtend  = input.int(8, "FVG box length (bars)", minval = 1, group = grpDist)
+
+grpStyle = "Style"
+colAccum = input.color(color.new(color.yellow, 75), "Accumulation", group = grpStyle)
+colManip = input.color(color.new(color.red, 70),    "Manipulation", group = grpStyle)
+colFvg   = input.color(color.new(color.orange, 35), "FVG (signal)", group = grpStyle)
+colDist  = input.color(color.new(color.blue, 82),   "Distribution", group = grpStyle)
+showLabels = input.bool(true, "Show phase labels", group = grpStyle)
+
+// ----------------------------------------------------------------------------
+//  State
+// ----------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+
+// phase: 0 = seeking accumulation+sweep, 2 = manipulation underway (await FVG),
+//        3 = distribution underway
+var int   phase     = 0
+var float accTop    = na
+var float accBot    = na
+var int   accStart  = na
+var int   accEnd    = na
+var bool  biasBear  = true
+var float manipExt  = na
+var int   manipStart = na
+var bool  rejected  = false
+var box   distBox   = na
+var float distExt   = na
+var int   distStart = na
+
+bool amdSignal = false   // true on the bar the FVG completes the sequence
+
+// ----------------------------------------------------------------------------
+//  Phase 0 — find a tight range, then a sweep beyond it (manipulation start)
+// ----------------------------------------------------------------------------
+if phase == 0
+    float aT  = ta.highest(high, accumLen)[1]
+    float aB  = ta.lowest(low,  accumLen)[1]
+    float buf = sweepBufTicks * syminfo.mintick
+    bool  tight = (aT - aB) > 0 and (aT - aB) <= accumMaxAtr * atr
+    if tight and allowBear and high > aT + buf
+        accTop     := aT
+        accBot     := aB
+        accEnd     := bar_index - 1
+        accStart   := bar_index - accumLen
+        biasBear   := true
+        manipExt   := high
+        manipStart := bar_index
+        rejected   := false
+        phase      := 2
+    else if tight and allowBull and low < aB - buf
+        accTop     := aT
+        accBot     := aB
+        accEnd     := bar_index - 1
+        accStart   := bar_index - accumLen
+        biasBear   := false
+        manipExt   := low
+        manipStart := bar_index
+        rejected   := false
+        phase      := 2
+
+// ----------------------------------------------------------------------------
+//  Phase 2 — manipulation underway; await rejection + first FVG (the signal)
+// ----------------------------------------------------------------------------
+if phase == 2
+    manipExt := biasBear ? math.max(manipExt, high) : math.min(manipExt, low)
+
+    // rejection: a close back inside the accumulation range
+    if biasBear and close < accTop
+        rejected := true
+    if (not biasBear) and close > accBot
+        rejected := true
+
+    bool bearFVG = high < low[2]      // gap down (bearish displacement)
+    bool bullFVG = low > high[2]       // gap up   (bullish displacement)
+    bool fvg = biasBear ? bearFVG : bullFVG
+    bool rejOk = not requireReject or rejected
+
+    if bar_index - manipStart > manipMaxBars
+        phase := 0                      // timed out, abandon setup (nothing drawn)
+    else if fvg and rejOk
+        amdSignal := true
+
+        // ---- draw the full sequence (in order) ----
+        // 1) Accumulation
+        box.new(accStart, accTop, accEnd, accBot, border_color = color.new(color.yellow, 30), bgcolor = colAccum)
+        // 2) Manipulation (the swept area beyond the range)
+        float mTop = biasBear ? manipExt : accBot
+        float mBot = biasBear ? accTop   : manipExt
+        box.new(accEnd, mTop, bar_index, mBot, border_color = color.new(color.red, 25), bgcolor = colManip)
+        // 3) FVG — the signal
+        float fvgTop = biasBear ? low[2] : low
+        float fvgBot = biasBear ? high   : high[2]
+        box.new(bar_index - 2, fvgTop, bar_index + fvgExtend, fvgBot, border_color = color.new(color.orange, 0), bgcolor = colFvg)
+        // 4) Distribution — zone that will extend with price during phase 3.
+        //    The moving edge tracks the extreme; the fixed edge is the range.
+        distExt   := biasBear ? low : high
+        distStart := bar_index
+        float dBoxTop = biasBear ? accBot : distExt
+        float dBoxBot = biasBear ? distExt : accTop
+        distBox   := box.new(bar_index, dBoxTop, bar_index + 1, dBoxBot, border_color = color.new(color.blue, 40), bgcolor = colDist)
+
+        if showLabels
+            label.new(int((accStart + accEnd) / 2), accTop, "Accumulation", yloc = yloc.price, style = label.style_label_down, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
+            label.new(manipStart, mTop, "Manipulation", yloc = yloc.price, style = label.style_label_down, color = color.new(color.red, 10), textcolor = color.white, size = size.small)
+            label.new(bar_index, biasBear ? fvgBot : fvgTop, "FVG", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(color.orange, 0), textcolor = color.black, size = size.small)
+            label.new(bar_index + 1, distExt, "Distribution", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(color.blue, 10), textcolor = color.white, size = size.small)
+
+        phase := 3
+
+// ----------------------------------------------------------------------------
+//  Phase 3 — distribution: extend the distribution zone with price
+// ----------------------------------------------------------------------------
+if phase == 3
+    distExt := biasBear ? math.min(distExt, low) : math.max(distExt, high)
+    if not na(distBox)
+        box.set_right(distBox, bar_index)
+        if biasBear
+            box.set_bottom(distBox, distExt)
+        else
+            box.set_top(distBox, distExt)
+    if bar_index - distStart > distExtend
+        phase := 0
+        rejected := false
+
+// ----------------------------------------------------------------------------
+//  Signal marker + alert
+// ----------------------------------------------------------------------------
+plotshape(amdSignal and biasBear, title = "Bearish AMD FVG", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small)
+plotshape(amdSignal and not biasBear, title = "Bullish AMD FVG", style = shape.triangleup, location = location.belowbar, color = color.teal, size = size.small)
+alertcondition(amdSignal, title = "AMD FVG signal", message = "ICT AMD sequence completed — FVG formed")
+
+// ----------------------------------------------------------------------------
+//  Legend
+// ----------------------------------------------------------------------------
+if showLabels and barstate.islast
+    var table lg = table.new(position.top_right, 1, 5, border_width = 1)
+    table.cell(lg, 0, 0, "ICT AMD", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(lg, 0, 1, "1 Accumulation (range)", text_color = color.black, bgcolor = color.new(color.yellow, 0), text_size = size.tiny)
+    table.cell(lg, 0, 2, "2 Manipulation (sweep)", text_color = color.white, bgcolor = color.new(color.red, 0), text_size = size.tiny)
+    table.cell(lg, 0, 3, "3 FVG (signal)", text_color = color.black, bgcolor = color.new(color.orange, 0), text_size = size.tiny)
+    table.cell(lg, 0, 4, "4 Distribution (move)", text_color = color.white, bgcolor = color.new(color.blue, 0), text_size = size.tiny)
