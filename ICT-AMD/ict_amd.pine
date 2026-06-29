@@ -42,11 +42,20 @@ distExtend = input.int(40, "Distribution zone length (bars)", minval = 1, group 
 fvgExtend  = input.int(8, "FVG box length (bars)", minval = 1, group = grpDist)
 
 grpStyle = "Style"
-colAccum = input.color(color.new(color.yellow, 75), "Accumulation", group = grpStyle)
-colManip = input.color(color.new(color.red, 70),    "Manipulation", group = grpStyle)
-colFvg   = input.color(color.new(color.orange, 35), "FVG (signal)", group = grpStyle)
-colDist  = input.color(color.new(color.blue, 82),   "Distribution", group = grpStyle)
+// Base colors — balanced mid-luminance tones that read well on both light and
+// dark chart backgrounds. Zone fills derive from these via `fillTransp`.
+accumColor = input.color(#2e9e6a, "Accumulation (green)", group = grpStyle)
+manipColor = input.color(#e23b3b, "Manipulation (red)",   group = grpStyle)
+fvgColor   = input.color(#f5a623, "FVG / signal (orange)", group = grpStyle)
+distColor  = input.color(#3a7bd5, "Distribution (blue)",  group = grpStyle)
+fillTransp = input.int(82, "Zone fill transparency", minval = 0, maxval = 100, group = grpStyle)
 showLabels = input.bool(true, "Show phase labels", group = grpStyle)
+
+// derived fill colors (FVG kept a touch more visible since it is the signal)
+color colAccum = color.new(accumColor, fillTransp)
+color colManip = color.new(manipColor, fillTransp)
+color colFvg   = color.new(fvgColor, 30)
+color colDist  = color.new(distColor, fillTransp)
 
 // ----------------------------------------------------------------------------
 //  State
@@ -127,15 +136,15 @@ if phase == 2
 
         // ---- draw the full sequence (in order) ----
         // 1) Accumulation
-        box.new(accStart, accTop, accEnd, accBot, border_color = color.new(color.yellow, 30), bgcolor = colAccum)
+        box.new(accStart, accTop, accEnd, accBot, border_color = color.new(accumColor, 20), bgcolor = colAccum)
         // 2) Manipulation (the swept area beyond the range)
         float mTop = biasBear ? manipExt : accBot
         float mBot = biasBear ? accTop   : manipExt
-        box.new(accEnd, mTop, bar_index, mBot, border_color = color.new(color.red, 25), bgcolor = colManip)
+        box.new(accEnd, mTop, bar_index, mBot, border_color = color.new(manipColor, 20), bgcolor = colManip)
         // 3) FVG — the signal
         float fvgTop = biasBear ? low[2] : low
         float fvgBot = biasBear ? high   : high[2]
-        box.new(bar_index - 2, fvgTop, bar_index + fvgExtend, fvgBot, border_color = color.new(color.orange, 0), bgcolor = colFvg)
+        box.new(bar_index - 2, fvgTop, bar_index + fvgExtend, fvgBot, border_color = color.new(fvgColor, 0), bgcolor = colFvg)
         // 4) Distribution — zone that begins right at the FVG and extends with
         //    price during phase 3. The fixed edge is anchored to the FVG so the
         //    zone is connected to it; the moving edge tracks the extreme.
@@ -143,13 +152,13 @@ if phase == 2
         distStart := bar_index
         float dBoxTop = biasBear ? fvgBot : distExt   // bearish: top = FVG lower edge
         float dBoxBot = biasBear ? distExt : fvgTop   // bullish: bottom = FVG upper edge
-        distBox   := box.new(bar_index, dBoxTop, bar_index + 1, dBoxBot, border_color = color.new(color.blue, 40), bgcolor = colDist)
+        distBox   := box.new(bar_index, dBoxTop, bar_index + 1, dBoxBot, border_color = color.new(distColor, 30), bgcolor = colDist)
 
         if showLabels
-            label.new(int((accStart + accEnd) / 2), accTop, "Accumulation", yloc = yloc.price, style = label.style_label_down, color = color.new(color.yellow, 20), textcolor = color.black, size = size.small)
-            label.new(manipStart, mTop, "Manipulation", yloc = yloc.price, style = label.style_label_down, color = color.new(color.red, 10), textcolor = color.white, size = size.small)
-            label.new(bar_index, biasBear ? fvgBot : fvgTop, "FVG", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(color.orange, 0), textcolor = color.black, size = size.small)
-            label.new(bar_index + 1, distExt, "Distribution", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(color.blue, 10), textcolor = color.white, size = size.small)
+            label.new(int((accStart + accEnd) / 2), accTop, "Accumulation", yloc = yloc.price, style = label.style_label_down, color = color.new(accumColor, 0), textcolor = color.white, size = size.small)
+            label.new(manipStart, mTop, "Manipulation", yloc = yloc.price, style = label.style_label_down, color = color.new(manipColor, 0), textcolor = color.white, size = size.small)
+            label.new(bar_index, biasBear ? fvgBot : fvgTop, "FVG", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(fvgColor, 0), textcolor = color.black, size = size.small)
+            label.new(bar_index + 1, distExt, "Distribution", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(distColor, 0), textcolor = color.white, size = size.small)
 
         phase := 3
 
@@ -172,8 +181,8 @@ if phase == 3
 // ----------------------------------------------------------------------------
 //  Signal marker + alert
 // ----------------------------------------------------------------------------
-plotshape(amdSignal and biasBear, title = "Bearish AMD FVG", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small)
-plotshape(amdSignal and not biasBear, title = "Bullish AMD FVG", style = shape.triangleup, location = location.belowbar, color = color.teal, size = size.small)
+plotshape(amdSignal and biasBear, title = "Bearish AMD FVG", style = shape.triangledown, location = location.abovebar, color = manipColor, size = size.small)
+plotshape(amdSignal and not biasBear, title = "Bullish AMD FVG", style = shape.triangleup, location = location.belowbar, color = accumColor, size = size.small)
 alertcondition(amdSignal, title = "AMD FVG signal", message = "ICT AMD sequence completed — FVG formed")
 
 // ----------------------------------------------------------------------------
@@ -182,7 +191,7 @@ alertcondition(amdSignal, title = "AMD FVG signal", message = "ICT AMD sequence 
 if showLabels and barstate.islast
     var table lg = table.new(position.top_right, 1, 5, border_width = 1)
     table.cell(lg, 0, 0, "ICT AMD", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
-    table.cell(lg, 0, 1, "1 Accumulation (range)", text_color = color.black, bgcolor = color.new(color.yellow, 0), text_size = size.tiny)
-    table.cell(lg, 0, 2, "2 Manipulation (sweep)", text_color = color.white, bgcolor = color.new(color.red, 0), text_size = size.tiny)
-    table.cell(lg, 0, 3, "3 FVG (signal)", text_color = color.black, bgcolor = color.new(color.orange, 0), text_size = size.tiny)
-    table.cell(lg, 0, 4, "4 Distribution (move)", text_color = color.white, bgcolor = color.new(color.blue, 0), text_size = size.tiny)
+    table.cell(lg, 0, 1, "1 Accumulation (range)", text_color = color.white, bgcolor = accumColor, text_size = size.tiny)
+    table.cell(lg, 0, 2, "2 Manipulation (sweep)", text_color = color.white, bgcolor = manipColor, text_size = size.tiny)
+    table.cell(lg, 0, 3, "3 FVG (signal)", text_color = color.black, bgcolor = fvgColor, text_size = size.tiny)
+    table.cell(lg, 0, 4, "4 Distribution (move)", text_color = color.white, bgcolor = distColor, text_size = size.tiny)
