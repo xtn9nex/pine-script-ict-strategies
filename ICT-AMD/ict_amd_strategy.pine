@@ -262,11 +262,14 @@ if phase == 3
 
     bool tHit = biasBear ? low <= plTarget : high >= plTarget
     bool sHit = biasBear ? high >= plStop  : low <= plStop
-    // a filled trade is resolved when the position returns to flat (the exit
-    // bracket above closes it at target / stop / break-even). An unfilled
-    // retrace entry is abandoned if price reaches target/stop or it times out.
+    // A filled trade is resolved when the position returns to flat (the exit
+    // bracket above closes it at target / stop / break-even).
     bool tradeClosed = posOpened and strategy.position_size == 0
-    bool noFill      = (not posOpened) and (tHit or sHit or (bar_index - tradeStartBar > retraceWait))
+    // Only a RETRACE (limit) entry can fail to fill — and never on the entry
+    // bar itself, since a market entry fills at that bar's close (its big
+    // displacement range would otherwise trip tHit/sHit and cancel the order).
+    bool isRetrace = entryMode == "Retrace into FVG"
+    bool noFill = isRetrace and (not posOpened) and bar_index > tradeStartBar and (tHit or sHit or (bar_index - tradeStartBar > retraceWait))
 
     if tradeClosed or noFill
         if noFill
