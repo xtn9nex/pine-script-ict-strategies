@@ -42,6 +42,11 @@ grpDir = "Direction"
 allowBear = input.bool(true, "Detect bearish AMD (sweep up → down)", group = grpDir)
 allowBull = input.bool(true, "Detect bullish AMD (sweep down → up)", group = grpDir)
 
+grpBE = "Auto Break-Even"
+useBreakEven  = input.bool(true, "Move stop to break-even", group = grpBE, tooltip = "Once price covers the chosen % of the distance from entry to target, move the stop to the entry (break-even).")
+bePct         = input.float(50.0, "Trigger at % of the way to target", minval = 1.0, maxval = 99.0, step = 5.0, group = grpBE)
+beOffsetTicks = input.float(0.0, "Break-even offset (ticks)", minval = 0.0, group = grpBE, tooltip = "Optional offset from exact entry (e.g. to cover fees). 0 = exact entry.")
+
 grpTrade = "Targets / Stops"
 entryMode = input.string("Market on signal (always fills)", "Entry mode", options = ["Market on signal (always fills)", "Retrace into FVG"], group = grpTrade, tooltip = "Market on signal: entry at the close of the bar that completes the FVG (where price actually is) — always triggers. Retrace into FVG: entry at the FVG midpoint, which requires price to pull back into the gap and may never fill in a strong move.")
 rMultiple    = input.float(1.7, "Reward multiple (R)", minval = 0.1, step = 0.1, group = grpTrade)
@@ -86,6 +91,8 @@ var box   tpBox    = na     // green reward (entry -> target) block
 var box   slBox    = na     // red risk (entry -> stop) block
 var float plStop   = na
 var float plTarget = na
+var float plEntry  = na
+var bool  beDone   = false  // break-even already applied for the live setup
 var int   lastEndBar = na   // bar where the previous setup resolved
 
 bool amdSignal = false   // true on the bar the FVG completes the sequence
@@ -184,6 +191,8 @@ if phase == 2
         float target = biasBear ? entry - rMultiple * risk : entry + rMultiple * risk
         plStop    := stop
         plTarget  := target
+        plEntry   := entry
+        beDone    := false
         // red risk block (entry <-> stop) and green reward block (entry <-> target)
         float slTop = biasBear ? stop  : entry
         float slBot = biasBear ? entry : stop
@@ -209,9 +218,25 @@ if phase == 3
         box.set_right(tpBox, bar_index)
     if not na(slBox)
         box.set_right(slBox, bar_index)
+
+    // auto break-even: once price covers bePct% of the way to target, move the
+    // stop to entry (the red risk block tightens to break-even).
+    if useBreakEven and not beDone
+        float beTrigger = plEntry + (plTarget - plEntry) * bePct / 100.0
+        bool  beReached = biasBear ? low <= beTrigger : high >= beTrigger
+        if beReached
+            float beStop = biasBear ? plEntry + beOffsetTicks * syminfo.mintick : plEntry - beOffsetTicks * syminfo.mintick
+            plStop := beStop
+            beDone := true
+            if not na(slBox)
+                if biasBear
+                    box.set_top(slBox, beStop)
+                else
+                    box.set_bottom(slBox, beStop)
+
     bool tHit = biasBear ? low <= plTarget : high >= plTarget
     bool sHit = biasBear ? high >= plStop  : low <= plStop
-    // the blocks extend until price hits the target or the stop (no time cap)
+    // the blocks extend until price hits the target or the (possibly BE'd) stop
     if tHit or sHit
         phase := 0
         rejected := false
