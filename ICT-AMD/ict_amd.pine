@@ -1,0 +1,262 @@
+//@version=6
+// ============================================================================
+//  ICT AMD — Accumulation / Manipulation / Distribution  (Power of 3)
+// ----------------------------------------------------------------------------
+//  Detects the AMD sequence and only draws it once the phases form IN ORDER.
+//  The MAIN SIGNAL is the formation of the first FVG (step 3).
+//
+//    1) ACCUMULATION  — a tight consolidation, detected adaptively: the base is
+//                       grown backward from the breakout while its high-low
+//                       range stays within accumMaxAtr x ATR (>= minAccumBars).
+//    2) MANIPULATION  — a sweep/breakout beyond that range that is then
+//                       REJECTED (price closes back inside the range):
+//                         break ABOVE  -> bearish bias (distribute down)
+//                         break BELOW  -> bullish bias (distribute up)
+//    3) FVG (SIGNAL)  — the first Fair Value Gap in the distribution
+//                       direction after the rejection. Triggers everything.
+//    4) TARGET/STOP   — instead of a distribution box, the trade's risk/reward
+//                       is drawn: a RED stop block (entry -> beyond the
+//                       manipulation extreme) and a GREEN target block
+//                       (entry -> R multiple). They extend until price hits
+//                       the stop or the target.
+//
+//  Nothing is drawn until the FVG completes the sequence. Each completed
+//  sequence leaves its boxes on the chart as a historical signal.
+// ============================================================================
+
+indicator("ICT AMD — Accumulation/Manipulation/Distribution", overlay = true, max_boxes_count = 500, max_lines_count = 200, max_labels_count = 200)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpDetect = "Detection"
+atrLen       = input.int(14, "ATR length", minval = 1, group = grpDetect)
+accumMaxAtr  = input.float(2.0, "Max accumulation range (× ATR)", minval = 0.1, step = 0.1, group = grpDetect, tooltip = "The base is grown backward from the breakout only while its high-low range stays within this many ATRs, so the box hugs a genuinely tight consolidation.")
+minAccumBars = input.int(10, "Min accumulation length (bars)", minval = 2, group = grpDetect, tooltip = "A tight base must be at least this many bars to qualify as accumulation (filters out brief pauses).")
+maxAccumBars = input.int(60, "Max accumulation lookback (bars)", minval = 5, group = grpDetect, tooltip = "How far back to grow the consolidation while it stays tight.")
+sweepBufTicks = input.float(0.0, "Sweep buffer (ticks)", minval = 0.0, group = grpDetect, tooltip = "Price must exceed the range edge by this many ticks to count as a manipulation sweep.")
+manipMaxBars = input.int(10, "Max bars from sweep to FVG", minval = 1, group = grpDetect, tooltip = "If the rejection + FVG do not occur within this many bars of the sweep, the setup is abandoned.")
+requireReject = input.bool(true, "Require manipulation to be rejected", group = grpDetect, tooltip = "Require price to close back inside the accumulation range (sweep rejected) before accepting the FVG signal.")
+
+grpDir = "Direction"
+allowBear = input.bool(true, "Detect bearish AMD (sweep up → down)", group = grpDir)
+allowBull = input.bool(true, "Detect bullish AMD (sweep down → up)", group = grpDir)
+
+grpBE = "Auto Break-Even"
+useBreakEven  = input.bool(true, "Move stop to break-even", group = grpBE, tooltip = "Once price covers the chosen % of the distance from entry to target, move the stop to the entry (break-even).")
+bePct         = input.float(50.0, "Trigger at % of the way to target", minval = 1.0, maxval = 99.0, step = 5.0, group = grpBE)
+beOffsetTicks = input.float(0.0, "Break-even offset (ticks)", minval = 0.0, group = grpBE, tooltip = "Optional offset from exact entry (e.g. to cover fees). 0 = exact entry.")
+
+grpTrade = "Targets / Stops"
+entryMode = input.string("Market on signal (always fills)", "Entry mode", options = ["Market on signal (always fills)", "Retrace into FVG"], group = grpTrade, tooltip = "Market on signal: entry at the close of the bar that completes the FVG (where price actually is) — always triggers. Retrace into FVG: entry at the FVG midpoint, which requires price to pull back into the gap and may never fill in a strong move.")
+rMultiple    = input.float(1.7, "Reward multiple (R)", minval = 0.1, step = 0.1, group = grpTrade)
+stopBufTicks = input.float(2.0, "Stop buffer beyond manipulation (ticks)", minval = 0.0, group = grpTrade)
+fvgExtend    = input.int(2, "FVG box length (bars)", minval = 1, group = grpTrade)
+
+grpStyle = "Style"
+// Base colors — balanced mid-luminance tones that read well on both light and
+// dark chart backgrounds. Zone fills derive from these via `fillTransp`.
+accumColor = input.color(#787b86, "Accumulation (grey)", group = grpStyle)
+manipColor = input.color(#e23b3b, "Manipulation (red)",   group = grpStyle)
+fvgColor   = input.color(#f5a623, "FVG / signal (orange)", group = grpStyle)
+tpColor    = input.color(#26a69a, "Target / profit (green)", group = grpStyle)
+slColor    = input.color(#ef5350, "Stop loss (red)",         group = grpStyle)
+fillTransp = input.int(82, "Zone fill transparency", minval = 0, maxval = 100, group = grpStyle)
+showLabels = input.bool(true, "Show phase labels", group = grpStyle)
+
+// derived fill colors (FVG kept a touch more visible since it is the signal)
+color colAccum = color.new(accumColor, fillTransp)
+color colManip = color.new(manipColor, fillTransp)
+color colFvg   = color.new(fvgColor, 30)
+color colTp    = color.new(tpColor, fillTransp)
+color colSl    = color.new(slColor, fillTransp)
+
+// ----------------------------------------------------------------------------
+//  State
+// ----------------------------------------------------------------------------
+float atr = ta.atr(atrLen)
+
+// phase: 0 = seeking accumulation+sweep, 2 = manipulation underway (await FVG),
+//        3 = trade live (target/stop blocks extending until resolved)
+var int   phase     = 0
+var float accTop    = na
+var float accBot    = na
+var int   accStart  = na
+var int   accEnd    = na
+var bool  biasBear  = true
+var float manipExt  = na
+var int   manipStart = na
+var bool  rejected  = false
+var box   tpBox    = na     // green reward (entry -> target) block
+var box   slBox    = na     // red risk (entry -> stop) block
+var float plStop   = na
+var float plTarget = na
+var float plEntry  = na
+var bool  beDone   = false  // break-even already applied for the live setup
+var int   lastEndBar = na   // bar where the previous setup resolved
+
+bool amdSignal = false   // true on the bar the FVG completes the sequence
+
+// ----------------------------------------------------------------------------
+//  Phase 0 — find a tight range, then a sweep beyond it (manipulation start)
+// ----------------------------------------------------------------------------
+if phase == 0
+    float buf      = sweepBufTicks * syminfo.mintick
+    float maxRange = accumMaxAtr * atr
+
+    // Grow the consolidation backward from the bar before the current one,
+    // adding bars only while the running high-low range stays tight. This makes
+    // the box hug the actual base instead of a fixed-size window.
+    float rngHigh = high[1]
+    float rngLow  = low[1]
+    int   baseLen = 1
+    for i = 2 to maxAccumBars
+        if na(high[i]) or na(low[i])
+            break
+        float nh = math.max(rngHigh, high[i])
+        float nl = math.min(rngLow,  low[i])
+        if (nh - nl) > maxRange
+            break
+        rngHigh := nh
+        rngLow  := nl
+        baseLen := i
+
+    bool baseOk = baseLen >= minAccumBars and (rngHigh - rngLow) > 0
+    int  accStartCand = bar_index - baseLen
+    // do not start a new setup until its base is fully past the previous setup
+    bool canStart = na(lastEndBar) or accStartCand > lastEndBar
+
+    if baseOk and canStart and allowBear and high > rngHigh + buf
+        accTop     := rngHigh
+        accBot     := rngLow
+        accEnd     := bar_index - 1
+        accStart   := accStartCand
+        biasBear   := true
+        manipExt   := high
+        manipStart := bar_index
+        rejected   := false
+        phase      := 2
+    else if baseOk and canStart and allowBull and low < rngLow - buf
+        accTop     := rngHigh
+        accBot     := rngLow
+        accEnd     := bar_index - 1
+        accStart   := accStartCand
+        biasBear   := false
+        manipExt   := low
+        manipStart := bar_index
+        rejected   := false
+        phase      := 2
+
+// ----------------------------------------------------------------------------
+//  Phase 2 — manipulation underway; await rejection + first FVG (the signal)
+// ----------------------------------------------------------------------------
+if phase == 2
+    manipExt := biasBear ? math.max(manipExt, high) : math.min(manipExt, low)
+
+    // rejection: a close back inside the accumulation range
+    if biasBear and close < accTop
+        rejected := true
+    if (not biasBear) and close > accBot
+        rejected := true
+
+    bool bearFVG = high < low[2]      // gap down (bearish displacement)
+    bool bullFVG = low > high[2]       // gap up   (bullish displacement)
+    bool fvg = biasBear ? bearFVG : bullFVG
+    bool rejOk = not requireReject or rejected
+
+    if bar_index - manipStart > manipMaxBars
+        phase := 0                      // timed out, abandon setup (nothing drawn)
+    else if fvg and rejOk
+        amdSignal := true
+
+        // ---- draw the full sequence (in order) ----
+        // 1) Accumulation
+        box.new(accStart, accTop, accEnd, accBot, border_color = color.new(accumColor, 20), bgcolor = colAccum)
+        // 2) Manipulation (the swept area beyond the range)
+        float mTop = biasBear ? manipExt : accBot
+        float mBot = biasBear ? accTop   : manipExt
+        box.new(accEnd, mTop, bar_index, mBot, border_color = color.new(manipColor, 20), bgcolor = colManip)
+        // 3) FVG — the signal
+        float fvgTop = biasBear ? low[2] : low
+        float fvgBot = biasBear ? high   : high[2]
+        box.new(bar_index - 2, fvgTop, bar_index + fvgExtend, fvgBot, border_color = color.new(fvgColor, 0), bgcolor = colFvg)
+        // 4) Target & Stop blocks (replace the old distribution box).
+        //    Entry  = signal-bar close (always fills) OR the FVG midpoint (retrace).
+        //    Stop   = just beyond the manipulation extreme (swept liquidity).
+        //    Target = R multiple of the risk.
+        float entry  = entryMode == "Retrace into FVG" ? (fvgTop + fvgBot) / 2.0 : close
+        float buf    = stopBufTicks * syminfo.mintick
+        float stop   = biasBear ? manipExt + buf : manipExt - buf
+        float risk   = math.abs(entry - stop)
+        float target = biasBear ? entry - rMultiple * risk : entry + rMultiple * risk
+        plStop    := stop
+        plTarget  := target
+        plEntry   := entry
+        beDone    := false
+        // red risk block (entry <-> stop) and green reward block (entry <-> target)
+        float slTop = biasBear ? stop  : entry
+        float slBot = biasBear ? entry : stop
+        float tpTop = biasBear ? entry : target
+        float tpBot = biasBear ? target : entry
+        slBox := box.new(bar_index, slTop, bar_index + 1, slBot, border_color = color.new(slColor, 20), bgcolor = colSl)
+        tpBox := box.new(bar_index, tpTop, bar_index + 1, tpBot, border_color = color.new(tpColor, 20), bgcolor = colTp)
+
+        if showLabels
+            label.new(int((accStart + accEnd) / 2), accTop, "Accumulation", yloc = yloc.price, style = label.style_label_down, color = color.new(accumColor, 0), textcolor = color.white, size = size.small)
+            label.new(manipStart, mTop, "Manipulation", yloc = yloc.price, style = label.style_label_down, color = color.new(manipColor, 0), textcolor = color.white, size = size.small)
+            label.new(bar_index, biasBear ? fvgBot : fvgTop, "FVG", yloc = yloc.price, style = biasBear ? label.style_label_up : label.style_label_down, color = color.new(fvgColor, 0), textcolor = color.black, size = size.small)
+            label.new(bar_index + 1, target, "Target", yloc = yloc.price, style = label.style_label_left, color = color.new(tpColor, 0), textcolor = color.white, size = size.small)
+            label.new(bar_index + 1, stop,   "Stop",   yloc = yloc.price, style = label.style_label_left, color = color.new(slColor, 0), textcolor = color.white, size = size.small)
+
+        phase := 3
+
+// ----------------------------------------------------------------------------
+//  Phase 3 — extend the target/stop blocks until price resolves them
+// ----------------------------------------------------------------------------
+if phase == 3
+    if not na(tpBox)
+        box.set_right(tpBox, bar_index)
+    if not na(slBox)
+        box.set_right(slBox, bar_index)
+
+    // auto break-even: once price covers bePct% of the way to target, move the
+    // stop to entry (the red risk block tightens to break-even).
+    if useBreakEven and not beDone
+        float beTrigger = plEntry + (plTarget - plEntry) * bePct / 100.0
+        bool  beReached = biasBear ? low <= beTrigger : high >= beTrigger
+        if beReached
+            float beStop = biasBear ? plEntry + beOffsetTicks * syminfo.mintick : plEntry - beOffsetTicks * syminfo.mintick
+            plStop := beStop
+            beDone := true
+            if not na(slBox)
+                if biasBear
+                    box.set_top(slBox, beStop)
+                else
+                    box.set_bottom(slBox, beStop)
+
+    bool tHit = biasBear ? low <= plTarget : high >= plTarget
+    bool sHit = biasBear ? high >= plStop  : low <= plStop
+    // the blocks extend until price hits the target or the (possibly BE'd) stop
+    if tHit or sHit
+        phase := 0
+        rejected := false
+        lastEndBar := bar_index
+
+// ----------------------------------------------------------------------------
+//  Signal marker + alert
+// ----------------------------------------------------------------------------
+plotshape(amdSignal and biasBear, title = "Bearish AMD FVG", style = shape.triangledown, location = location.abovebar, color = manipColor, size = size.small)
+plotshape(amdSignal and not biasBear, title = "Bullish AMD FVG", style = shape.triangleup, location = location.belowbar, color = tpColor, size = size.small)
+alertcondition(amdSignal, title = "AMD FVG signal", message = "ICT AMD sequence completed — FVG formed")
+
+// ----------------------------------------------------------------------------
+//  Legend
+// ----------------------------------------------------------------------------
+if showLabels and barstate.islast
+    var table lg = table.new(position.top_right, 1, 6, border_width = 1)
+    table.cell(lg, 0, 0, "ICT AMD", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(lg, 0, 1, "1 Accumulation (range)", text_color = color.white, bgcolor = accumColor, text_size = size.tiny)
+    table.cell(lg, 0, 2, "2 Manipulation (sweep)", text_color = color.white, bgcolor = manipColor, text_size = size.tiny)
+    table.cell(lg, 0, 3, "3 FVG (signal)", text_color = color.black, bgcolor = fvgColor, text_size = size.tiny)
+    table.cell(lg, 0, 4, "Target (" + str.tostring(rMultiple, "#.##") + "R)", text_color = color.white, bgcolor = tpColor, text_size = size.tiny)
+    table.cell(lg, 0, 5, "Stop (beyond manip)", text_color = color.white, bgcolor = slColor, text_size = size.tiny)
