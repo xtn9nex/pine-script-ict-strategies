@@ -45,7 +45,7 @@ accumMaxAtr  = input.float(2.0, "Max accumulation range (× ATR)", minval = 0.1,
 minAccumBars = input.int(10, "Min accumulation length (bars)", minval = 2, group = grpDetect, tooltip = "A tight base must be at least this many bars to qualify as accumulation (filters out brief pauses).")
 maxAccumBars = input.int(60, "Max accumulation lookback (bars)", minval = 5, group = grpDetect, tooltip = "How far back to grow the consolidation while it stays tight.")
 sweepBufTicks = input.float(0.0, "Sweep buffer (ticks)", minval = 0.0, group = grpDetect, tooltip = "Price must exceed the range edge by this many ticks to count as a manipulation sweep.")
-manipMaxBars = input.int(10, "Max bars from sweep to FVG", minval = 1, group = grpDetect, tooltip = "If the rejection + FVG do not occur within this many bars of the sweep, the setup is abandoned.")
+manipMaxBars = input.int(15, "Max bars from manipulation peak to signal", minval = 1, group = grpDetect, tooltip = "After price stops making new manipulation extremes (the peak), the cross-through signal must occur within this many bars, else the setup is abandoned. Anchoring to the peak (not the sweep start) gives the reversal enough time regardless of how long the sweep ran.")
 requireReject = input.bool(false, "Also require close back inside range", group = grpDetect, tooltip = "Optional extra confirmation: also require price to close back inside the accumulation range before accepting the cross-through signal. Off by default in V2 since the FVG cross is itself the rejection.")
 
 grpDir = "Direction"
@@ -98,6 +98,7 @@ var int   accEnd    = na
 var bool  biasBear  = true
 var float manipExt  = na
 var int   manipStart = na
+var int   manipPeakBar = na  // last bar that made a new manipulation extreme
 var bool  rejected  = false
 var bool  mFvgFound = false   // an FVG was left during the manipulation leg
 var float mFvgTop   = na      // manipulation FVG upper edge
@@ -152,6 +153,7 @@ if phase == 0
         biasBear   := true
         manipExt   := high
         manipStart := bar_index
+        manipPeakBar := bar_index
         rejected   := false
         mFvgFound  := false
         phase      := 2
@@ -163,6 +165,7 @@ if phase == 0
         biasBear   := false
         manipExt   := low
         manipStart := bar_index
+        manipPeakBar := bar_index
         rejected   := false
         mFvgFound  := false
         phase      := 2
@@ -172,7 +175,14 @@ if phase == 0
 //  it (the inversion signal)
 // ----------------------------------------------------------------------------
 if phase == 2
-    manipExt := biasBear ? math.max(manipExt, high) : math.min(manipExt, low)
+    // track the manipulation extreme AND the bar that made it (the peak), so the
+    // signal window can be measured from the peak rather than the sweep start.
+    if biasBear and high > manipExt
+        manipExt := high
+        manipPeakBar := bar_index
+    if (not biasBear) and low < manipExt
+        manipExt := low
+        manipPeakBar := bar_index
 
     // rejection: a close back inside the accumulation range (optional)
     if biasBear and close < accTop
@@ -196,8 +206,8 @@ if phase == 2
     bool crossThrough = mFvgFound and (biasBear ? close < mFvgBot : close > mFvgTop)
     bool rejOk = not requireReject or rejected
 
-    if bar_index - manipStart > manipMaxBars
-        phase := 0                      // timed out, abandon setup (nothing drawn)
+    if bar_index - manipPeakBar > manipMaxBars
+        phase := 0                      // no cross-through within the window; abandon
     else if crossThrough and rejOk
         amdSignal := true
 
