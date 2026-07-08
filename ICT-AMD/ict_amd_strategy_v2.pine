@@ -293,18 +293,21 @@ if phase == 3
 
     bool tHit = biasBear ? low <= plTarget : high >= plTarget
     bool sHit = biasBear ? high >= plStop  : low <= plStop
-    // A filled trade is resolved when the position returns to flat (the exit
-    // bracket above closes it at target / stop / break-even).
-    bool tradeClosed = posOpened and strategy.position_size == 0
-    // Only a RETRACE (limit) entry can fail to fill — and never on the entry
-    // bar itself, since a market entry fills at that bar's close (its big
-    // displacement range would otherwise trip tHit/sHit and cancel the order).
+    // Resolve once price REACHES the target or stop. Using the price levels
+    // (not the position-size transition) means a bar that GAPS past the level
+    // still resolves the setup — the previous version relied on observing the
+    // position return to flat, which a gap-close could skip, leaving phase 3
+    // stuck forever. Never resolve on the entry bar itself (a market entry
+    // fills at that bar's close; its displacement range would trip tHit/sHit).
+    bool priceResolved = bar_index > tradeStartBar and (tHit or sHit)
+    // A retrace (limit) entry that never fills is abandoned after the wait.
     bool isRetrace = entryMode == "Retrace into FVG"
-    bool noFill = isRetrace and (not posOpened) and bar_index > tradeStartBar and (tHit or sHit or (bar_index - tradeStartBar > retraceWait))
+    bool waitedOut  = isRetrace and (not posOpened) and (bar_index - tradeStartBar > retraceWait)
 
-    if tradeClosed or noFill
-        if noFill
-            strategy.cancel("AMD")
+    if priceResolved or waitedOut
+        strategy.cancel("AMD")               // cancel any still-pending entry
+        if strategy.position_size != 0
+            strategy.close("AMD")            // safety: never orphan an open position
         phase := 0
         rejected := false
         lastEndBar := bar_index
