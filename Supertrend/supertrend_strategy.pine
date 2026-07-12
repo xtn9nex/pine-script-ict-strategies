@@ -10,9 +10,10 @@
 //    STOP  : trails `stopBufferPts` beyond the line (below for longs, above for
 //            shorts) for the whole trade, ratcheting. Trailing-stop-only exit;
 //            no take-profit.
-//    RULES : one trade at a time; re-entry allowed after a stop-out while the
-//            trend persists, capped at `maxTradesPerTrend` entries per trend
-//            segment (resets on a flip) to reduce chop.
+//    RULES : one trade at a time; NEVER enter during a trend transition (no
+//            entries within `minBarsSinceFlip` bars of a flip); re-entry allowed
+//            after a stop-out while the trend persists, capped at
+//            `maxTradesPerTrend` entries per trend segment (resets on a flip).
 //
 //  Trend state is available as:
 //      direction : -1 = uptrend (line below price)   +1 = downtrend (above)
@@ -48,6 +49,7 @@ stopBufferPts = input.float(1.0, "Stop buffer from line (points)", minval = 0.0,
 allowLong  = input.bool(true, "Allow longs",  group = grpTrade)
 allowShort = input.bool(true, "Allow shorts", group = grpTrade)
 maxTradesPerTrend = input.int(2, "Max trades per trend segment", minval = 1, group = grpTrade, tooltip = "Cap the number of entries during a single Supertrend trend (resets when the trend flips). Reduces churn during choppy/consolidation periods.")
+minBarsSinceFlip  = input.int(1, "Min bars after a flip before entering", minval = 0, group = grpTrade, tooltip = "Never enter during the trend transition: no entry within this many bars of a Supertrend flip. 1 = exclude the flip bar itself; increase to keep entries further from the transition.")
 orderQty   = input.float(1.0, "Order size (contracts/shares/lots)", minval = 0.000001, group = grpTrade)
 
 grpStyle = "Style"
@@ -130,16 +132,24 @@ alertcondition(flipDn, "Supertrend flip down", "Supertrend flipped to DOWN")
 // ----------------------------------------------------------------------------
 var float trailStop = na
 
-// entries taken in the current trend segment; resets whenever the trend flips
+// entries taken in the current trend segment + bars since the last flip; both
+// reset whenever the trend flips
 var int tradesThisTrend = 0
+var int barsSinceFlip    = 0
 if direction != direction[1]
     tradesThisTrend := 0
+    barsSinceFlip   := 0
+else
+    barsSinceFlip   := barsSinceFlip + 1
 
 bool longSetup  = allowLong  and direction == -1 and low  <= supertrend + proximityPts and close > supertrend
 bool shortSetup = allowShort and direction ==  1 and high >= supertrend - proximityPts and close < supertrend
 
-if strategy.position_size == 0 and tradesThisTrend < maxTradesPerTrend
-    // flat & under the per-trend cap -> look for an entry
+// never enter during the trend transition (the flip bar / its neighborhood)
+bool trendEstablished = barsSinceFlip >= minBarsSinceFlip
+
+if strategy.position_size == 0 and trendEstablished and tradesThisTrend < maxTradesPerTrend
+    // flat, past the transition & under the per-trend cap -> look for an entry
     if longSetup
         strategy.entry("Long", strategy.long, qty = orderQty)
         trailStop := supertrend - stopBufferPts
