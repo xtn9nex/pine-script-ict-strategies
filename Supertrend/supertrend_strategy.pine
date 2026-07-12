@@ -1,14 +1,20 @@
 //@version=6
 // ============================================================================
-//  Supertrend — Strategy shell (TREND LINES ONLY — no entry/exit yet)
+//  Supertrend — Strategy (pullback-to-line entry, trailing-stop exit)
 // ----------------------------------------------------------------------------
-//  Plots the Supertrend trailing line with direction coloring, fills and flip
-//  markers. Entry/exit logic is intentionally OMITTED — the user will define
-//  the entry/exit conditions. The trend state is exposed for that purpose:
+//  Plots the Supertrend trailing line (direction coloring, fills, flip markers)
+//  and trades pullbacks to the line:
 //
+//    ENTRY : in the trend direction, when price comes within `proximityPts` of
+//            (or touches) the line but CLOSES back on the trend side.
+//    STOP  : starts `stopBufferPts` beyond the line, then trails exactly at the
+//            line (ratcheting). Trailing-stop-only exit; no take-profit.
+//    RULES : one trade at a time; re-entry allowed after a stop-out while the
+//            trend persists.
+//
+//  Trend state is available as:
 //      direction : -1 = uptrend (line below price)   +1 = downtrend (above)
-//      flipUp    : bar where trend flipped to up
-//      flipDn    : bar where trend flipped to down
+//      flipUp / flipDn : trend-flip bars
 //      supertrend: the active trailing-line value
 //
 //  Supertrend is built from three ingredients:
@@ -34,12 +40,20 @@ atrLen  = input.int(10, "ATR length", minval = 1, group = grpST)
 factor  = input.float(3.0, "Multiplier (factor)", minval = 0.1, step = 0.1, group = grpST)
 atrMeth = input.string("RMA (Wilder)", "ATR smoothing", options = ["RMA (Wilder)", "SMA", "EMA", "WMA"], group = grpST)
 
+grpTrade = "Entry / Exit"
+proximityPts  = input.float(1.0, "Entry proximity to line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "Enter when price comes within this many points of the Supertrend line (or touches it) but closes back on the trend side.")
+stopBufferPts = input.float(2.0, "Initial stop buffer beyond line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "At entry the stop sits this many points beyond the line; from the next bar it trails exactly at the line.")
+allowLong  = input.bool(true, "Allow longs",  group = grpTrade)
+allowShort = input.bool(true, "Allow shorts", group = grpTrade)
+orderQty   = input.float(1.0, "Order size (contracts/shares/lots)", minval = 0.000001, group = grpTrade)
+
 grpStyle = "Style"
 upColor   = input.color(#26a69a, "Uptrend",   group = grpStyle)
 downColor = input.color(#ef5350, "Downtrend", group = grpStyle)
 lineWidth = input.int(2, "Line width", minval = 1, group = grpStyle)
 showFill  = input.bool(true, "Shade fill toward price", group = grpStyle)
 showFlips = input.bool(true, "Show flip markers", group = grpStyle)
+stopColor = input.color(color.orange, "Trailing stop", group = grpStyle)
 
 // ----------------------------------------------------------------------------
 //  ATR (smoothing method selectable; RMA = classic Wilder / TradingView default)
@@ -100,7 +114,40 @@ alertcondition(flipUp, "Supertrend flip up",   "Supertrend flipped to UP")
 alertcondition(flipDn, "Supertrend flip down", "Supertrend flipped to DOWN")
 
 // ----------------------------------------------------------------------------
-//  ENTRY / EXIT — intentionally left blank.
-//  Add your conditions here using `direction`, `flipUp`, `flipDn`, `supertrend`.
-//  (Reminder: gate on confirmed bars to avoid intrabar repaint.)
+//  Entry / Exit
+//    Entry : price comes within `proximityPts` of (or touches) the line but
+//            CLOSES back on the trend side -> enter in the trend direction.
+//    Stop  : starts `stopBufferPts` beyond the line at entry, then trails
+//            EXACTLY at the line (ratcheting; frozen if the trend flips so the
+//            stop is never yanked to the opposite band). Trailing-stop only.
+//    One trade at a time; re-entry allowed after a stop-out while the trend
+//    persists. No take-profit.
 // ----------------------------------------------------------------------------
+var float trailStop = na
+
+bool longSetup  = allowLong  and direction == -1 and low  <= supertrend + proximityPts and close > supertrend
+bool shortSetup = allowShort and direction ==  1 and high >= supertrend - proximityPts and close < supertrend
+
+if strategy.position_size == 0
+    // flat -> look for an entry (re-entry naturally allowed on the next bar)
+    if longSetup
+        strategy.entry("Long", strategy.long, qty = orderQty)
+        trailStop := supertrend - stopBufferPts
+        strategy.exit("Long stop", from_entry = "Long", stop = trailStop)
+    else if shortSetup
+        strategy.entry("Short", strategy.short, qty = orderQty)
+        trailStop := supertrend + stopBufferPts
+        strategy.exit("Short stop", from_entry = "Short", stop = trailStop)
+else if strategy.position_size > 0
+    // long: trail up to the line while the uptrend holds
+    if direction == -1
+        trailStop := math.max(trailStop, supertrend)
+    strategy.exit("Long stop", from_entry = "Long", stop = trailStop)
+else
+    // short: trail down to the line while the downtrend holds
+    if direction == 1
+        trailStop := math.min(trailStop, supertrend)
+    strategy.exit("Short stop", from_entry = "Short", stop = trailStop)
+
+// show the live trailing stop while in a trade
+plot(strategy.position_size != 0 ? trailStop : na, "Trailing stop", color = stopColor, style = plot.style_linebr, linewidth = 1)
