@@ -7,13 +7,13 @@
 //
 //    ENTRY : in the trend direction, when price comes within `proximityPts` of
 //            (or touches) the line but CLOSES back on the trend side.
-//    STOP  : trails `stopBufferPts` beyond the line (below for longs, above for
-//            shorts) for the whole trade, ratcheting. Trailing-stop-only exit;
-//            no take-profit.
+//    STOP  : FIXED at `stopBufferPts` beyond the line at entry (defines 1R).
+//    TARGET: fixed take-profit at `rMultiple` x risk (default 2R). Exit is the
+//            fixed stop or the R target, whichever hits first (no trailing).
 //    RULES : one trade at a time; NEVER enter during a trend transition (no
 //            entries within `minBarsSinceFlip` bars of a flip); re-entry allowed
-//            after a stop-out while the trend persists, capped at
-//            `maxTradesPerTrend` entries per trend segment (resets on a flip).
+//            while the trend persists, capped at `maxTradesPerTrend` entries per
+//            trend segment (resets on a flip).
 //
 //  Trend state is available as:
 //      direction : -1 = uptrend (line below price)   +1 = downtrend (above)
@@ -45,7 +45,8 @@ atrMeth = input.string("RMA (Wilder)", "ATR smoothing", options = ["RMA (Wilder)
 
 grpTrade = "Entry / Exit"
 proximityPts  = input.float(1.0, "Entry proximity to line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "Enter when price comes within this many points of the Supertrend line (or touches it) but closes back on the trend side.")
-stopBufferPts = input.float(1.0, "Stop buffer from line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "The trailing stop always sits this many points beyond the Supertrend line (below it for longs, above it for shorts), maintained for the whole trade.")
+stopBufferPts = input.float(1.0, "Initial stop buffer from line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "The (fixed) initial stop sits this many points beyond the Supertrend line at entry — this defines 1R of risk.")
+rMultiple     = input.float(2.0, "Reward multiple (R)", minval = 0.1, step = 0.1, group = grpTrade, tooltip = "Take-profit distance as a multiple of the initial risk (entry-to-stop). Default 2R.")
 allowLong  = input.bool(true, "Allow longs",  group = grpTrade)
 allowShort = input.bool(true, "Allow shorts", group = grpTrade)
 maxTradesPerTrend = input.int(2, "Max trades per trend segment", minval = 1, group = grpTrade, tooltip = "Cap the number of entries during a single Supertrend trend (resets when the trend flips). Reduces churn during choppy/consolidation periods.")
@@ -58,7 +59,8 @@ downColor = input.color(#ef5350, "Downtrend", group = grpStyle)
 lineWidth = input.int(2, "Line width", minval = 1, group = grpStyle)
 showFill  = input.bool(true, "Shade fill toward price", group = grpStyle)
 showFlips = input.bool(true, "Show flip markers", group = grpStyle)
-stopColor = input.color(color.orange, "Trailing stop", group = grpStyle)
+stopColor = input.color(color.red,   "Stop level",   group = grpStyle)
+tpColor   = input.color(color.green, "Target level", group = grpStyle)
 
 // ----------------------------------------------------------------------------
 //  ATR (smoothing method selectable; RMA = classic Wilder / TradingView default)
@@ -120,17 +122,16 @@ alertcondition(flipDn, "Supertrend flip down", "Supertrend flipped to DOWN")
 
 // ----------------------------------------------------------------------------
 //  Entry / Exit
-//    Entry : price comes within `proximityPts` of (or touches) the line but
-//            CLOSES back on the trend side -> enter in the trend direction.
-//    Stop  : always sits `stopBufferPts` beyond the line (below for longs,
-//            above for shorts) and trails with it (ratcheting; frozen if the
-//            trend flips so the stop is never yanked to the opposite band).
-//            Trailing-stop only.
-//    One trade at a time; re-entry allowed after a stop-out while the trend
-//    persists, up to `maxTradesPerTrend` per trend segment (resets on a flip).
-//    No take-profit.
+//    Entry  : price comes within `proximityPts` of (or touches) the line but
+//             CLOSES back on the trend side -> enter in the trend direction.
+//    Stop   : FIXED at `stopBufferPts` beyond the line at entry (= 1R risk).
+//    Target : fixed take-profit at `rMultiple` x that risk (default 2R).
+//    Exit   : whichever of the fixed stop / target price reaches first.
+//    One trade at a time; no entries during the transition; re-entry allowed
+//    while the trend persists, capped at `maxTradesPerTrend` per trend segment.
 // ----------------------------------------------------------------------------
-var float trailStop = na
+var float stopLevel = na
+var float tpLevel   = na
 
 // entries taken in the current trend segment + bars since the last flip; both
 // reset whenever the trend flips
@@ -151,25 +152,29 @@ bool trendEstablished = barsSinceFlip >= minBarsSinceFlip
 if strategy.position_size == 0 and trendEstablished and tradesThisTrend < maxTradesPerTrend
     // flat, past the transition & under the per-trend cap -> look for an entry
     if longSetup
+        float entryPx = close
+        float stp     = supertrend - stopBufferPts
+        float risk    = entryPx - stp
+        stopLevel := stp
+        tpLevel   := entryPx + rMultiple * risk
         strategy.entry("Long", strategy.long, qty = orderQty)
-        trailStop := supertrend - stopBufferPts
-        strategy.exit("Long stop", from_entry = "Long", stop = trailStop)
+        strategy.exit("Long exit", from_entry = "Long", stop = stopLevel, limit = tpLevel)
         tradesThisTrend += 1
     else if shortSetup
+        float entryPx = close
+        float stp     = supertrend + stopBufferPts
+        float risk    = stp - entryPx
+        stopLevel := stp
+        tpLevel   := entryPx - rMultiple * risk
         strategy.entry("Short", strategy.short, qty = orderQty)
-        trailStop := supertrend + stopBufferPts
-        strategy.exit("Short stop", from_entry = "Short", stop = trailStop)
+        strategy.exit("Short exit", from_entry = "Short", stop = stopLevel, limit = tpLevel)
         tradesThisTrend += 1
 else if strategy.position_size > 0
-    // long: trail at line - buffer while the uptrend holds (keeps the buffer)
-    if direction == -1
-        trailStop := math.max(trailStop, supertrend - stopBufferPts)
-    strategy.exit("Long stop", from_entry = "Long", stop = trailStop)
-else
-    // short: trail at line + buffer while the downtrend holds
-    if direction == 1
-        trailStop := math.min(trailStop, supertrend + stopBufferPts)
-    strategy.exit("Short stop", from_entry = "Short", stop = trailStop)
+    // maintain the fixed stop + R target for the open long
+    strategy.exit("Long exit", from_entry = "Long", stop = stopLevel, limit = tpLevel)
+else if strategy.position_size < 0
+    strategy.exit("Short exit", from_entry = "Short", stop = stopLevel, limit = tpLevel)
 
-// show the live trailing stop while in a trade
-plot(strategy.position_size != 0 ? trailStop : na, "Trailing stop", color = stopColor, style = plot.style_linebr, linewidth = 1)
+// show the fixed stop (red) and R target (green) while in a trade
+plot(strategy.position_size != 0 ? stopLevel : na, "Stop",   color = stopColor, style = plot.style_linebr, linewidth = 1)
+plot(strategy.position_size != 0 ? tpLevel   : na, "Target", color = tpColor,   style = plot.style_linebr, linewidth = 1)
