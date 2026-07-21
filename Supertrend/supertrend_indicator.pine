@@ -1,0 +1,171 @@
+//@version=6
+// ============================================================================
+//  Supertrend — Indicator (visualizes the strategy's setups as stop/target blocks)
+// ----------------------------------------------------------------------------
+//  Same Supertrend + entry logic as `supertrend_strategy.pine`, but instead of
+//  placing orders it DRAWS each trade like the ICT-AMD indicator does:
+//    - a RED risk block  (entry -> stop)
+//    - a GREEN reward block (entry -> R target)
+//  The blocks extend right until price hits the stop or the target, then freeze
+//  as a historical record.
+//
+//    ENTRY : in the trend direction, when price comes within `proximityPts` of
+//            (or touches) the line but CLOSES back on the trend side.
+//    STOP  : fixed at `stopBufferPts` beyond the line at entry (= 1R).
+//    TARGET: fixed at `rMultiple` x risk (default 2R).
+//    RULES : one setup at a time; no entries during a trend transition; re-entry
+//            while the trend persists, capped at `maxTradesPerTrend` per segment.
+//
+//  NOTE: the current (unclosed) bar can flip/qualify intrabar; treat live
+//  drawings as provisional until the bar closes.
+// ============================================================================
+
+indicator("Supertrend Indicator", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 200)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpST = "Supertrend"
+srcIn   = input.source(hl2, "Source", group = grpST)
+atrLen  = input.int(10, "ATR length", minval = 1, group = grpST)
+factor  = input.float(3.0, "Multiplier (factor)", minval = 0.1, step = 0.1, group = grpST)
+atrMeth = input.string("RMA (Wilder)", "ATR smoothing", options = ["RMA (Wilder)", "SMA", "EMA", "WMA"], group = grpST)
+
+grpTrade = "Setups"
+proximityPts  = input.float(1.0, "Entry proximity to line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "Signal when price comes within this many points of the Supertrend line (or touches it) but closes back on the trend side.")
+stopBufferPts = input.float(1.0, "Initial stop buffer from line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "The stop sits this many points beyond the line at entry — this defines 1R of risk.")
+rMultiple     = input.float(2.0, "Reward multiple (R)", minval = 0.1, step = 0.1, group = grpTrade, tooltip = "Target distance as a multiple of the initial risk (entry-to-stop). Default 2R.")
+allowLong  = input.bool(true, "Show longs",  group = grpTrade)
+allowShort = input.bool(true, "Show shorts", group = grpTrade)
+maxTradesPerTrend = input.int(2, "Max setups per trend segment", minval = 1, group = grpTrade, tooltip = "Cap the number of setups drawn during a single Supertrend trend (resets on a flip).")
+minBarsSinceFlip  = input.int(1, "Min bars after a flip before a setup", minval = 0, group = grpTrade, tooltip = "No setup within this many bars of a Supertrend flip. 1 = exclude the flip bar.")
+
+grpStyle = "Style"
+upColor    = input.color(#26a69a, "Uptrend line",   group = grpStyle)
+downColor  = input.color(#ef5350, "Downtrend line", group = grpStyle)
+lineWidth  = input.int(2, "Line width", minval = 1, group = grpStyle)
+showFill   = input.bool(true, "Shade fill toward price", group = grpStyle)
+showFlips  = input.bool(true, "Show flip markers", group = grpStyle)
+slColor    = input.color(#ef5350, "Stop block (red)",   group = grpStyle)
+tpColor    = input.color(#26a69a, "Target block (green)", group = grpStyle)
+blockTransp = input.int(85, "Block transparency", minval = 0, maxval = 100, group = grpStyle)
+showLabels = input.bool(true, "Show entry/stop/target labels", group = grpStyle)
+
+// ----------------------------------------------------------------------------
+//  ATR + Supertrend (identical to the strategy)
+// ----------------------------------------------------------------------------
+float tr  = ta.tr(true)
+float atr = switch atrMeth
+    "SMA" => ta.sma(tr, atrLen)
+    "EMA" => ta.ema(tr, atrLen)
+    "WMA" => ta.wma(tr, atrLen)
+    => ta.rma(tr, atrLen)
+
+float upperBand = srcIn + factor * atr
+float lowerBand = srcIn - factor * atr
+float prevUpper = nz(upperBand[1], upperBand)
+float prevLower = nz(lowerBand[1], lowerBand)
+lowerBand := lowerBand > prevLower or close[1] < prevLower ? lowerBand : prevLower
+upperBand := upperBand < prevUpper or close[1] > prevUpper ? upperBand : prevUpper
+
+int   direction  = na
+float supertrend = na
+float prevST = supertrend[1]
+if na(atr[1])
+    direction := 1
+else if prevST == prevUpper
+    direction := close > upperBand ? -1 : 1
+else
+    direction := close < lowerBand ? 1 : -1
+supertrend := direction == -1 ? lowerBand : upperBand
+
+bool flipUp = direction == -1 and direction[1] == 1
+bool flipDn = direction ==  1 and direction[1] == -1
+
+// ----------------------------------------------------------------------------
+//  Supertrend visualization
+// ----------------------------------------------------------------------------
+float upSeg = direction == -1 ? supertrend : na
+float dnSeg = direction ==  1 ? supertrend : na
+pUp = plot(upSeg, "Uptrend line",   color = upColor,   style = plot.style_linebr, linewidth = lineWidth)
+pDn = plot(dnSeg, "Downtrend line", color = downColor, style = plot.style_linebr, linewidth = lineWidth)
+pClose = plot(showFill ? close : na, "", display = display.none)
+fill(pUp, pClose, color.new(upColor, 90),   title = "Uptrend fill")
+fill(pDn, pClose, color.new(downColor, 90), title = "Downtrend fill")
+plotshape(showFlips and flipUp, "Flip up",   style = shape.triangleup,   location = location.belowbar, color = upColor,   size = size.tiny)
+plotshape(showFlips and flipDn, "Flip down", style = shape.triangledown, location = location.abovebar, color = downColor, size = size.tiny)
+
+// ----------------------------------------------------------------------------
+//  Setup detection + stop/target block drawing (mirrors the AMD indicator)
+// ----------------------------------------------------------------------------
+var bool  inTrade  = false
+var bool  tLong    = false
+var float tStop    = na
+var float tTarget  = na
+var box   slBox    = na
+var box   tpBox    = na
+var int   tradesThisTrend = 0
+var int   barsSinceFlip   = 0
+
+if direction != direction[1]
+    tradesThisTrend := 0
+    barsSinceFlip   := 0
+else
+    barsSinceFlip   := barsSinceFlip + 1
+
+bool longSetup  = allowLong  and direction == -1 and low  <= supertrend + proximityPts and close > supertrend
+bool shortSetup = allowShort and direction ==  1 and high >= supertrend - proximityPts and close < supertrend
+bool trendEstablished = barsSinceFlip >= minBarsSinceFlip
+
+bool amdEntryLong  = false
+bool amdEntryShort = false
+bool resolvedThisBar = false
+
+// 1) manage an open (virtual) setup: extend blocks; resolve on stop/target
+if inTrade
+    if not na(slBox)
+        box.set_right(slBox, bar_index)
+    if not na(tpBox)
+        box.set_right(tpBox, bar_index)
+    bool stopHit = tLong ? low  <= tStop   : high >= tStop
+    bool tgtHit  = tLong ? high >= tTarget : low  <= tTarget
+    if stopHit or tgtHit
+        inTrade := false
+        resolvedThisBar := true
+
+// 2) new setup when flat, past the transition, and under the per-trend cap
+if (not inTrade) and (not resolvedThisBar) and trendEstablished and tradesThisTrend < maxTradesPerTrend and (longSetup or shortSetup)
+    bool  isLong  = longSetup
+    float entryPx = close
+    float stp     = isLong ? supertrend - stopBufferPts : supertrend + stopBufferPts
+    float risk    = math.abs(entryPx - stp)
+    float tgt     = isLong ? entryPx + rMultiple * risk : entryPx - rMultiple * risk
+
+    inTrade := true
+    tLong   := isLong
+    tStop   := stp
+    tTarget := tgt
+    tradesThisTrend += 1
+    amdEntryLong  := isLong
+    amdEntryShort := not isLong
+
+    // red risk block (entry<->stop) and green reward block (entry<->target)
+    float slTop = isLong ? entryPx : stp
+    float slBot = isLong ? stp     : entryPx
+    float tpTop = isLong ? tgt     : entryPx
+    float tpBot = isLong ? entryPx : tgt
+    slBox := box.new(bar_index, slTop, bar_index + 1, slBot, border_color = color.new(slColor, 40), bgcolor = color.new(slColor, blockTransp))
+    tpBox := box.new(bar_index, tpTop, bar_index + 1, tpBot, border_color = color.new(tpColor, 40), bgcolor = color.new(tpColor, blockTransp))
+
+    if showLabels
+        label.new(bar_index, entryPx, isLong ? "▲ Long" : "▼ Short", yloc = yloc.price, style = isLong ? label.style_label_up : label.style_label_down, color = color.new(isLong ? upColor : downColor, 0), textcolor = color.white, size = size.tiny)
+        label.new(bar_index + 1, tgt, "Target", yloc = yloc.price, style = label.style_label_left, color = color.new(tpColor, 0), textcolor = color.white, size = size.tiny)
+        label.new(bar_index + 1, stp, "Stop",   yloc = yloc.price, style = label.style_label_left, color = color.new(slColor, 0), textcolor = color.white, size = size.tiny)
+
+// ----------------------------------------------------------------------------
+//  Alerts
+// ----------------------------------------------------------------------------
+alertcondition(amdEntryLong,  "Supertrend long setup",  "Supertrend long setup (pullback held)")
+alertcondition(amdEntryShort, "Supertrend short setup", "Supertrend short setup (pullback held)")
+alertcondition(flipUp, "Supertrend flip up",   "Supertrend flipped to UP")
+alertcondition(flipDn, "Supertrend flip down", "Supertrend flipped to DOWN")

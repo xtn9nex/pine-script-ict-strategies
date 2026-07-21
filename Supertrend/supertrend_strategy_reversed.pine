@@ -1,0 +1,186 @@
+//@version=6
+// ============================================================================
+//  Supertrend — Strategy (REVERSED: take the opposite side, swap stop/target)
+// ----------------------------------------------------------------------------
+//  Identical setup detection to the base Supertrend strategy, but each trade is
+//  INVERTED: on a long signal it goes SHORT, on a short signal it goes LONG, and
+//  the stop/target are swapped — the base long's TARGET becomes this short's
+//  STOP, and the base long's STOP becomes this short's TARGET (and vice versa).
+//
+//    SIGNAL: same pullback-to-line setup (price comes within `proximityPts` of
+//            the line, or touches it, but CLOSES back on the trend side).
+//    TRADE : opposite direction to the signal.
+//    LEVELS: stop = base target level, target = base stop level (swapped). So a
+//            base 2R setup becomes a ~0.5R trade in the opposite direction.
+//    RULES : one trade at a time; no entries within `minBarsSinceFlip` bars of a
+//            flip; capped at `maxTradesPerTrend` per trend segment.
+//
+//  Trend state is available as:
+//      direction : -1 = uptrend (line below price)   +1 = downtrend (above)
+//      flipUp / flipDn : trend-flip bars
+//      supertrend: the active trailing-line value
+//
+//  Supertrend is built from three ingredients:
+//    1) a source (default hl2),
+//    2) ATR (length + smoothing method) for volatility,
+//    3) a multiplier (factor) for band distance.
+//  The bands "ratchet" (only tighten in the trend's favor) and the line flips
+//  when price closes through the opposing band.
+//
+//  NOTE on repainting: the current (unclosed) bar can flip intrabar. Any future
+//  entry/exit logic should act on confirmed/closed bars (e.g. barstate.isconfirmed
+//  or [1]-offset) to keep the backtest honest.
+// ============================================================================
+
+strategy("Supertrend Strategy (Reversed)", overlay = true, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0, calc_on_order_fills = false, process_orders_on_close = true, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpST = "Supertrend"
+srcIn   = input.source(hl2, "Source", group = grpST)
+atrLen  = input.int(10, "ATR length", minval = 1, group = grpST)
+factor  = input.float(2.0, "Multiplier (factor)", minval = 0.1, step = 0.1, group = grpST)
+atrMeth = input.string("RMA (Wilder)", "ATR smoothing", options = ["RMA (Wilder)", "SMA", "EMA", "WMA"], group = grpST)
+
+grpTrade = "Entry / Exit"
+proximityPts  = input.float(1.0, "Entry proximity to line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "Enter when price comes within this many points of the Supertrend line (or touches it) but closes back on the trend side.")
+stopBufferPts = input.float(1.0, "Initial stop buffer from line (points)", minval = 0.0, step = 0.25, group = grpTrade, tooltip = "The (fixed) initial stop sits this many points beyond the Supertrend line at entry — this defines 1R of risk.")
+rMultiple     = input.float(0.9, "Reward multiple (R)", minval = 0.1, step = 0.1, group = grpTrade, tooltip = "Base-setup reward multiple (entry-to-target). In this reversed strategy the base target/stop are swapped, so this sets the trade's risk distance.")
+allowLong  = input.bool(true, "Trade long signals (→ short)",  group = grpTrade, tooltip = "Act on long setups. In this reversed strategy a long signal opens a SHORT.")
+allowShort = input.bool(true, "Trade short signals (→ long)", group = grpTrade, tooltip = "Act on short setups. In this reversed strategy a short signal opens a LONG.")
+maxTradesPerTrend = input.int(1, "Max trades per trend segment", minval = 1, group = grpTrade, tooltip = "Cap the number of entries during a single Supertrend trend (resets when the trend flips). Reduces churn during choppy/consolidation periods.")
+minBarsSinceFlip  = input.int(1, "Min bars after a flip before entering", minval = 0, group = grpTrade, tooltip = "Never enter during the trend transition: no entry within this many bars of a Supertrend flip. 1 = exclude the flip bar itself; increase to keep entries further from the transition.")
+orderQty   = input.float(1.0, "Order size (contracts/shares/lots)", minval = 0.000001, group = grpTrade)
+
+grpStyle = "Style"
+upColor   = input.color(#26a69a, "Uptrend",   group = grpStyle)
+downColor = input.color(#ef5350, "Downtrend", group = grpStyle)
+lineWidth = input.int(2, "Line width", minval = 1, group = grpStyle)
+showFill  = input.bool(true, "Shade fill toward price", group = grpStyle)
+showFlips = input.bool(true, "Show flip markers", group = grpStyle)
+stopColor = input.color(color.red,   "Stop level",   group = grpStyle)
+tpColor   = input.color(color.green, "Target level", group = grpStyle)
+
+// ----------------------------------------------------------------------------
+//  ATR (smoothing method selectable; RMA = classic Wilder / TradingView default)
+// ----------------------------------------------------------------------------
+float tr  = ta.tr(true)
+float atr = switch atrMeth
+    "SMA" => ta.sma(tr, atrLen)
+    "EMA" => ta.ema(tr, atrLen)
+    "WMA" => ta.wma(tr, atrLen)
+    => ta.rma(tr, atrLen)
+
+// ----------------------------------------------------------------------------
+//  Supertrend calculation (canonical: ratcheting bands + close-through flip)
+// ----------------------------------------------------------------------------
+float upperBand = srcIn + factor * atr
+float lowerBand = srcIn - factor * atr
+float prevUpper = nz(upperBand[1], upperBand)
+float prevLower = nz(lowerBand[1], lowerBand)
+
+// bands only move in the trend's favor (ratchet), unless price closed through
+lowerBand := lowerBand > prevLower or close[1] < prevLower ? lowerBand : prevLower
+upperBand := upperBand < prevUpper or close[1] > prevUpper ? upperBand : prevUpper
+
+int   direction  = na
+float supertrend = na
+float prevST = supertrend[1]
+if na(atr[1])
+    direction := 1
+else if prevST == prevUpper
+    direction := close > upperBand ? -1 : 1
+else
+    direction := close < lowerBand ? 1 : -1
+supertrend := direction == -1 ? lowerBand : upperBand
+
+// trend flips (exposed for the eventual entry/exit logic)
+bool flipUp = direction == -1 and direction[1] == 1
+bool flipDn = direction ==  1 and direction[1] == -1
+
+// ----------------------------------------------------------------------------
+//  Visualization
+// ----------------------------------------------------------------------------
+// draw the active band, broken on flips so the two colors don't connect
+float upSeg = direction == -1 ? supertrend : na
+float dnSeg = direction ==  1 ? supertrend : na
+pUp = plot(upSeg, "Uptrend line",   color = upColor,   style = plot.style_linebr, linewidth = lineWidth)
+pDn = plot(dnSeg, "Downtrend line", color = downColor, style = plot.style_linebr, linewidth = lineWidth)
+
+// shaded fill between the trailing line and price
+pClose = plot(showFill ? close : na, "", display = display.none)
+fill(pUp, pClose, color.new(upColor, 90),   title = "Uptrend fill")
+fill(pDn, pClose, color.new(downColor, 90), title = "Downtrend fill")
+
+// flip markers
+plotshape(showFlips and flipUp, "Flip up",   style = shape.triangleup,   location = location.belowbar, color = upColor,   size = size.tiny)
+plotshape(showFlips and flipDn, "Flip down", style = shape.triangledown, location = location.abovebar, color = downColor, size = size.tiny)
+
+alertcondition(flipUp, "Supertrend flip up",   "Supertrend flipped to UP")
+alertcondition(flipDn, "Supertrend flip down", "Supertrend flipped to DOWN")
+
+// ----------------------------------------------------------------------------
+//  Entry / Exit  (REVERSED)
+//    Signal : same pullback-to-line setup as the base strategy.
+//    Trade  : OPPOSITE direction (long signal -> short, short signal -> long).
+//    Levels : stop/target swapped vs the base strategy — the base target level
+//             becomes this trade's STOP, and the base stop level becomes this
+//             trade's TARGET.
+//    Exit   : whichever of the (swapped) stop / target price reaches first.
+//    One trade at a time; no entries during the transition; capped at
+//    `maxTradesPerTrend` per trend segment.
+// ----------------------------------------------------------------------------
+var float stopLevel = na
+var float tpLevel   = na
+
+// entries taken in the current trend segment + bars since the last flip; both
+// reset whenever the trend flips
+var int tradesThisTrend = 0
+var int barsSinceFlip    = 0
+if direction != direction[1]
+    tradesThisTrend := 0
+    barsSinceFlip   := 0
+else
+    barsSinceFlip   := barsSinceFlip + 1
+
+bool longSetup  = allowLong  and direction == -1 and low  <= supertrend + proximityPts and close > supertrend
+bool shortSetup = allowShort and direction ==  1 and high >= supertrend - proximityPts and close < supertrend
+
+// never enter during the trend transition (the flip bar / its neighborhood)
+bool trendEstablished = barsSinceFlip >= minBarsSinceFlip
+
+if strategy.position_size == 0 and trendEstablished and tradesThisTrend < maxTradesPerTrend
+    // flat, past the transition & under the per-trend cap -> look for a setup
+    if longSetup
+        // base setup is LONG -> take the SHORT, swapping stop/target
+        float entryPx    = close
+        float baseStop   = supertrend - stopBufferPts        // base long stop
+        float risk       = entryPx - baseStop
+        float baseTarget = entryPx + rMultiple * risk        // base long target
+        stopLevel := baseTarget                              // short stop  = base target
+        tpLevel   := baseStop                                // short target = base stop
+        strategy.entry("Short", strategy.short, qty = orderQty)
+        strategy.exit("Short exit", from_entry = "Short", stop = stopLevel, limit = tpLevel)
+        tradesThisTrend += 1
+    else if shortSetup
+        // base setup is SHORT -> take the LONG, swapping stop/target
+        float entryPx    = close
+        float baseStop   = supertrend + stopBufferPts        // base short stop
+        float risk       = baseStop - entryPx
+        float baseTarget = entryPx - rMultiple * risk        // base short target
+        stopLevel := baseTarget                              // long stop   = base target
+        tpLevel   := baseStop                                // long target = base stop
+        strategy.entry("Long", strategy.long, qty = orderQty)
+        strategy.exit("Long exit", from_entry = "Long", stop = stopLevel, limit = tpLevel)
+        tradesThisTrend += 1
+else if strategy.position_size > 0
+    // maintain the swapped stop/target for the open long (from a short signal)
+    strategy.exit("Long exit", from_entry = "Long", stop = stopLevel, limit = tpLevel)
+else if strategy.position_size < 0
+    // maintain the swapped stop/target for the open short (from a long signal)
+    strategy.exit("Short exit", from_entry = "Short", stop = stopLevel, limit = tpLevel)
+
+// show the fixed stop (red) and R target (green) while in a trade
+plot(strategy.position_size != 0 ? stopLevel : na, "Stop",   color = stopColor, style = plot.style_linebr, linewidth = 1)
+plot(strategy.position_size != 0 ? tpLevel   : na, "Target", color = tpColor,   style = plot.style_linebr, linewidth = 1)
